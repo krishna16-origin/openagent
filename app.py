@@ -15,20 +15,28 @@ Data lives in ./data/ (maximus.db, projects/, sandboxes/). No external DB/server
 from __future__ import annotations
 
 import asyncio
+import copy
 import base64
 import hashlib
 import ipaddress
+import random
 import json
 import logging
 import math
 import os
 import re
+import shlex
 import shutil
+import socket
+import subprocess
+import sys
 import sqlite3
 import tempfile
 import time
+import urllib.parse
 import uuid
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
+from enum import Enum
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -38,9 +46,9 @@ from urllib.parse import urlparse
 
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, Field
@@ -86,8 +94,6 @@ class S:
     OMNIROUTE_API_KEY = _env("OMNIROUTE_API_KEY", "")
     OMNIROUTE_TIMEOUT_S = int(_env("OMNIROUTE_TIMEOUT_S", "60"))
     OMNIROUTE_DEFAULT_CAPABILITY = _env("OMNIROUTE_DEFAULT_CAPABILITY", "reasoning")
-    SANDBOX_ADAPTER = _env("SANDBOX_ADAPTER", "local")
-    E2B_API_KEY = _env("E2B_API_KEY", "")
     ALLOWED_SANDBOX_ROOT = _env("ALLOWED_SANDBOX_ROOT", str(BASE_DIR / "data" / "sandboxes"))
     MAX_TOKENS_PER_TASK = int(_env("MAX_TOKENS_PER_TASK", "120000"))
     MAX_COST_USD_PER_TASK = float(_env("MAX_COST_USD_PER_TASK", "5.0"))
@@ -146,19 +152,68 @@ class AppError(Exception):
 _BLOCKED_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1", "169.254.169.254", "metadata.google.internal"}
 
 
+def _ip_is_forbidden(ip: ipaddress._BaseAddress) -> bool:
+    return bool(ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+                or ip.is_multicast or ip.is_unspecified
+                or (getattr(ip, "ipv4_mapped", None) and _ip_is_forbidden(ip.ipv4_mapped)))
+
+
+_DNS_CACHE: dict[str, tuple[float, list[str]]] = {}
+
+
+def _resolve(host: str, ttl: float = 60.0) -> list[str]:
+    now = time.time()
+    hit = _DNS_CACHE.get(host)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+        addrs = sorted({i[4][0] for i in infos})
+    except Exception:
+        addrs = []
+    _DNS_CACHE[host] = (now, addrs)
+    return addrs
+
+
 def assert_url_allowed(url: str, allow_private: bool = False) -> str:
+    """SSRF guard.
+
+    The previous version raised inside a try/except ValueError, so its own rejection was
+    swallowed and every private IP outside the literal blocklist was allowed through.
+    This checks the literal host, then resolves the name so a public hostname pointing at
+    10.x / 192.168.x / 169.254.169.254 cannot be used to reach the internal network.
+    """
     u = urlparse(url)
     if u.scheme not in ("http", "https"):
-        raise ValueError(f"blocked scheme: {u.scheme}")
-    host = (u.hostname or "").lower()
-    if host in _BLOCKED_HOSTS and not allow_private:
+        raise ValueError(f"blocked scheme: {u.scheme or 'none'}")
+    host = (u.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        raise ValueError("blocked: no host in url")
+    if allow_private:
+        return url
+    if host in _BLOCKED_HOSTS or host.endswith(".internal") or host.endswith(".local"):
         raise ValueError(f"blocked host (SSRF): {host}")
+
+    literal: ipaddress._BaseAddress | None = None
     try:
-        ip = ipaddress.ip_address(host)
-        if (ip.is_private or ip.is_loopback or ip.is_link_local) and not allow_private:
-            raise ValueError(f"blocked private IP: {host}")
+        literal = ipaddress.ip_address(host)
     except ValueError:
-        pass
+        literal = None                      # a name, not an address — resolve it below
+    if literal is not None:
+        if _ip_is_forbidden(literal):
+            raise ValueError(f"blocked private address (SSRF): {host}")
+        return url
+
+    addrs = _resolve(host)
+    if not addrs:
+        raise ValueError(f"blocked: could not resolve {host}")
+    for a in addrs:
+        try:
+            if _ip_is_forbidden(ipaddress.ip_address(a)):
+                raise ValueError(f"blocked: {host} resolves to internal address {a}")
+        except ValueError as e:
+            if "blocked" in str(e):
+                raise
     return url
 
 
@@ -235,6 +290,363 @@ class RateLimiter:
 
 
 limiter = RateLimiter(S.RATE_LIMIT_PER_MIN)
+
+
+# =====================================================================================
+# 3b. Free-tier budget control — token buckets, adaptive limits, circuit breakers
+# =====================================================================================
+# These are DEFAULTS for well-known free tiers. They are starting points, not gospel:
+# providers change them, and they differ per model and per account. Every field can be
+# overridden per provider via PROVIDER_LIMITS_JSON, and every gate adapts downward
+# automatically when the provider answers 429.
+FREE_TIER_DEFAULTS: dict[str, dict] = {
+    #                     rpm    tpm      rpd     concurrency
+    "groq":        dict(rpm=30,  tpm=6000,    rpd=14400, concurrency=2),
+    "gemini":      dict(rpm=15,  tpm=1000000, rpd=1500,  concurrency=2),
+    "mistral":     dict(rpm=60,  tpm=500000,  rpd=0,     concurrency=2),
+    "openrouter":  dict(rpm=20,  tpm=0,       rpd=50,    concurrency=2),
+    "deepseek":    dict(rpm=60,  tpm=0,       rpd=0,     concurrency=4),
+    "nvidia":      dict(rpm=40,  tpm=0,       rpd=1000,  concurrency=2),
+    "openai":      dict(rpm=500, tpm=30000,   rpd=10000, concurrency=8),
+    "anthropic":   dict(rpm=50,  tpm=20000,   rpd=0,     concurrency=4),
+    "cohere":      dict(rpm=20,  tpm=0,       rpd=1000,  concurrency=2),
+    "together":    dict(rpm=60,  tpm=0,       rpd=0,     concurrency=4),
+    "_default":    dict(rpm=600, tpm=0,       rpd=0,     concurrency=8),
+    "local":       dict(rpm=0,   tpm=0,       rpd=0,     concurrency=16),
+}
+
+
+def _limits_for(provider: str) -> dict:
+    override = _env("PROVIDER_LIMITS_JSON", "")
+    if override:
+        try:
+            table = json.loads(override)
+            if provider in table:
+                base = dict(FREE_TIER_DEFAULTS.get(provider, FREE_TIER_DEFAULTS["_default"]))
+                base.update(table[provider])
+                return base
+        except Exception as e:
+            log.warning("PROVIDER_LIMITS_JSON ignored: %s", e)
+    return dict(FREE_TIER_DEFAULTS.get(provider, FREE_TIER_DEFAULTS["_default"]))
+
+
+class TokenBucket:
+    """Continuous-refill bucket. Lets callers run right up to the limit, never past it.
+
+    A bucket with rate=500/s and capacity=500 sustains exactly 500 tokens/second:
+    each acquire waits only as long as the refill actually needs.
+    """
+
+    def __init__(self, rate_per_sec: float, capacity: float | None = None):
+        self.rate = max(0.0, float(rate_per_sec))
+        self.capacity = float(capacity if capacity is not None else max(rate_per_sec, 1.0))
+        self._tokens = self.capacity
+        self._last = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    def _refill(self) -> None:
+        now = time.monotonic()
+        delta = now - self._last
+        if delta > 0:
+            self._tokens = min(self.capacity, self._tokens + delta * self.rate)
+            self._last = now
+
+    async def acquire(self, amount: float = 1.0, timeout_s: float = 300.0) -> float:
+        """Block until `amount` is available. Returns seconds waited."""
+        if self.rate <= 0:
+            return 0.0                      # unlimited
+        amount = min(max(amount, 0.0), self.capacity)
+        waited = 0.0
+        deadline = time.monotonic() + timeout_s
+        while True:
+            async with self._lock:
+                self._refill()
+                if self._tokens >= amount:
+                    self._tokens -= amount
+                    return waited
+                deficit = amount - self._tokens
+                sleep_s = deficit / self.rate
+            if time.monotonic() + sleep_s > deadline:
+                raise AppError(f"rate limit wait exceeded {timeout_s:.0f}s", 429)
+            sleep_s = min(max(sleep_s, 0.005), 5.0)
+            await asyncio.sleep(sleep_s)
+            waited += sleep_s
+
+    async def give_back(self, amount: float) -> None:
+        if self.rate <= 0 or amount <= 0:
+            return
+        async with self._lock:
+            self._refill()
+            self._tokens = min(self.capacity, self._tokens + amount)
+
+    def set_rate(self, rate_per_sec: float) -> None:
+        self.rate = max(0.0, float(rate_per_sec))
+        self.capacity = max(self.capacity, self.rate)
+
+    @property
+    def available(self) -> float:
+        self._refill()
+        return round(self._tokens, 2)
+
+
+class SlidingWindow:
+    """Hard guarantee: no 60s window ever exceeds `limit`.
+
+    A token bucket alone cannot promise this — its burst capacity stacks on top of the
+    refill rate, so a 30k/min budget can emit ~37k in the first minute. This keeps
+    60 one-second slots and refuses anything that would breach the window total, which
+    is what providers actually measure.
+    """
+
+    __slots__ = ("limit", "window_s", "_slots", "_base", "_lock")
+
+    def __init__(self, limit: int, window_s: int = 60):
+        self.limit = int(limit)
+        self.window_s = int(window_s)
+        self._slots: deque[tuple[int, float]] = deque()   # (second, amount)
+        self._base = 0.0
+        self._lock = asyncio.Lock()
+
+    def _evict(self, now: int) -> None:
+        cutoff = now - self.window_s
+        while self._slots and self._slots[0][0] <= cutoff:
+            self._base -= self._slots.popleft()[1]
+        if self._base < 0:
+            self._base = 0.0
+
+    def _total(self, now: int) -> float:
+        self._evict(now)
+        return self._base
+
+    async def acquire(self, amount: float, timeout_s: float = 300.0) -> float:
+        if self.limit <= 0:
+            return 0.0
+        amount = min(amount, self.limit)
+        waited = 0.0
+        deadline = time.monotonic() + timeout_s
+        while True:
+            async with self._lock:
+                now = int(time.monotonic())
+                if self._total(now) + amount <= self.limit:
+                    if self._slots and self._slots[-1][0] == now:
+                        sec, amt = self._slots.pop()
+                        self._slots.append((sec, amt + amount))
+                    else:
+                        self._slots.append((now, amount))
+                    self._base += amount
+                    return waited
+                oldest = self._slots[0][0] if self._slots else now
+                sleep_s = max(0.02, (oldest + self.window_s) - time.monotonic() + 0.01)
+            if time.monotonic() + sleep_s > deadline:
+                raise AppError(f"rate limit wait exceeded {timeout_s:.0f}s", 429)
+            sleep_s = min(sleep_s, 2.0)
+            await asyncio.sleep(sleep_s)
+            waited += sleep_s
+
+    async def give_back(self, amount: float) -> None:
+        if self.limit <= 0 or amount <= 0:
+            return
+        async with self._lock:
+            now = int(time.monotonic())
+            self._evict(now)
+            give = min(amount, self._base)
+            self._base -= give
+            while give > 0 and self._slots:
+                sec, amt = self._slots.pop()
+                if amt > give:
+                    self._slots.append((sec, amt - give))
+                    break
+                give -= amt
+
+    @property
+    def used(self) -> float:
+        return round(self._total(int(time.monotonic())), 2)
+
+
+class DailyCounter:
+    def __init__(self, limit: int):
+        self.limit = int(limit)
+        self.count = 0
+        self.day = time.gmtime().tm_yday
+
+    def _roll(self) -> None:
+        d = time.gmtime().tm_yday
+        if d != self.day:
+            self.day, self.count = d, 0
+
+    def check_and_add(self, n: int = 1) -> None:
+        if self.limit <= 0:
+            return
+        self._roll()
+        if self.count + n > self.limit:
+            raise AppError("provider daily request quota exhausted", 429)
+        self.count += n
+
+    @property
+    def remaining(self) -> int:
+        if self.limit <= 0:
+            return -1
+        self._roll()
+        return max(0, self.limit - self.count)
+
+
+class CircuitBreaker:
+    def __init__(self, threshold: int = 5, cooldown_s: float = 30.0):
+        self.threshold, self.cooldown_s = threshold, cooldown_s
+        self.failures = 0
+        self.opened_at = 0.0
+
+    @property
+    def state(self) -> str:
+        if self.failures < self.threshold:
+            return "closed"
+        if time.monotonic() - self.opened_at > self.cooldown_s:
+            return "half_open"
+        return "open"
+
+    def check(self) -> None:
+        if self.state == "open":
+            raise AppError("provider circuit breaker open", 503)
+
+    def record(self, ok: bool) -> None:
+        if ok:
+            self.failures = 0
+        else:
+            self.failures += 1
+            if self.failures == self.threshold:
+                self.opened_at = time.monotonic()
+
+
+def estimate_tokens(messages: list[dict] | str, max_out: int = 0) -> int:
+    """Conservative pre-flight estimate. Deliberately over-estimates rather than under."""
+    if isinstance(messages, str):
+        chars = len(messages)
+    else:
+        chars = sum(len(str(m.get("content", ""))) + 8 for m in messages)
+    return int(chars / 3.2) + max_out + 16      # 3.2 chars/token errs high for English
+
+
+class ProviderGate:
+    """Everything needed to stay inside one provider's limits and still go flat out."""
+
+    def __init__(self, provider: str, limits: dict | None = None):
+        self.provider = provider
+        lim = limits or _limits_for(provider)
+        self.configured = dict(lim)
+        self.rpm, self.tpm, self.rpd = int(lim["rpm"]), int(lim["tpm"]), int(lim["rpd"])
+        # pacing buckets hold at most ~1 second of burst; the windows are authoritative
+        self.req_bucket = TokenBucket(self.rpm / 60.0, capacity=max(1.0, self.rpm / 60.0))
+        self.tok_bucket = TokenBucket(self.tpm / 60.0, capacity=max(1.0, self.tpm / 60.0)) if self.tpm else TokenBucket(0)
+        self.req_window = SlidingWindow(self.rpm)
+        self.tok_window = SlidingWindow(self.tpm)
+        self.daily = DailyCounter(self.rpd)
+        self.sem = asyncio.Semaphore(max(1, int(lim["concurrency"])))
+        self.breaker = CircuitBreaker()
+        self.scale = 1.0                    # adaptive multiplier, shrinks on 429
+        self.stats = {"requests": 0, "tokens": 0, "throttled_s": 0.0, "rate_limited": 0, "errors": 0}
+
+    async def acquire(self, est_tokens: int) -> float:
+        self.breaker.check()
+        self.daily.check_and_add(1)
+        waited = await self.req_window.acquire(1.0)
+        waited += await self.req_bucket.acquire(1.0)
+        if self.tpm:
+            waited += await self.tok_window.acquire(est_tokens)
+            waited += await self.tok_bucket.acquire(est_tokens)
+        self.stats["throttled_s"] = round(self.stats["throttled_s"] + waited, 3)
+        return waited
+
+    async def settle(self, est_tokens: int, actual_tokens: int) -> None:
+        """Reconcile the estimate against reality so the budget stays accurate."""
+        self.stats["requests"] += 1
+        self.stats["tokens"] += max(0, actual_tokens)
+        if not self.tpm:
+            return
+        diff = est_tokens - actual_tokens
+        if diff > 0:
+            await self.tok_window.give_back(diff)       # we over-reserved, hand it back
+            await self.tok_bucket.give_back(diff)
+        elif diff < 0:
+            await self.tok_window.acquire(-diff, timeout_s=60)
+
+    def on_rate_limited(self, retry_after_s: float | None = None) -> float:
+        """Provider said 429: shrink our own ceiling and respect Retry-After."""
+        self.stats["rate_limited"] += 1
+        self.scale = max(0.2, self.scale * 0.7)
+        self.req_bucket.set_rate(self.rpm * self.scale / 60.0)
+        self.req_window.limit = max(1, int(self.rpm * self.scale))
+        if self.tpm:
+            self.tok_bucket.set_rate(self.tpm * self.scale / 60.0)
+            self.tok_window.limit = max(1, int(self.tpm * self.scale))
+        log.warning("provider %s rate-limited; throttling to %.0f%% of configured",
+                    self.provider, self.scale * 100)
+        return float(retry_after_s) if retry_after_s else min(60.0, 2.0 / self.scale)
+
+    def on_success(self) -> None:
+        self.breaker.record(True)
+        if self.scale < 1.0:                              # creep back up after recovery
+            self.scale = min(1.0, self.scale * 1.05)
+            self.req_bucket.set_rate(self.rpm * self.scale / 60.0)
+            self.req_window.limit = max(1, int(self.rpm * self.scale))
+            if self.tpm:
+                self.tok_bucket.set_rate(self.tpm * self.scale / 60.0)
+                self.tok_window.limit = max(1, int(self.tpm * self.scale))
+
+    def on_error(self) -> None:
+        self.stats["errors"] += 1
+        self.breaker.record(False)
+
+    def snapshot(self) -> dict:
+        return {
+            "provider": self.provider, "configured": self.configured,
+            "effective_scale": round(self.scale, 3), "breaker": self.breaker.state,
+            "requests_used_60s": self.req_window.used,
+            "tokens_used_60s": self.tok_window.used if self.tpm else -1,
+            "requests_remaining_60s": max(0.0, self.rpm - self.req_window.used),
+            "tokens_remaining_60s": max(0.0, self.tpm - self.tok_window.used) if self.tpm else -1,
+            "daily_remaining": self.daily.remaining, **self.stats,
+        }
+
+
+GATES: dict[str, ProviderGate] = {}
+
+
+def gate_for(provider: str) -> ProviderGate:
+    p = (provider or "_default").lower()
+    if p not in GATES:
+        GATES[p] = ProviderGate(p)
+    return GATES[p]
+
+
+class UserQuota:
+    """Per-user ceilings so one tenant cannot drain a shared free tier."""
+
+    def __init__(self, tokens_per_day: int, requests_per_min: int):
+        self.tokens_per_day = tokens_per_day
+        self.req_bucket = TokenBucket(requests_per_min / 60.0, capacity=max(1.0, requests_per_min / 4.0))
+        self.daily_tokens = 0
+        self.day = time.gmtime().tm_yday
+
+    async def acquire(self, est_tokens: int) -> None:
+        d = time.gmtime().tm_yday
+        if d != self.day:
+            self.day, self.daily_tokens = d, 0
+        if self.tokens_per_day and self.daily_tokens + est_tokens > self.tokens_per_day:
+            raise AppError("daily token quota exhausted for this user", 429)
+        await self.req_bucket.acquire(1.0)
+        self.daily_tokens += est_tokens
+
+
+USER_QUOTAS: dict[str, UserQuota] = {}
+
+
+def quota_for(user_id: str) -> UserQuota:
+    if user_id not in USER_QUOTAS:
+        USER_QUOTAS[user_id] = UserQuota(
+            int(_env("USER_TOKENS_PER_DAY", "0")),
+            int(_env("USER_REQUESTS_PER_MIN", "120")))
+    return USER_QUOTAS[user_id]
+
 
 # =====================================================================================
 # 4. SECRETS — BYOK encryption at rest (Fernet). Plaintext never stored/logged/returned.
@@ -328,6 +740,26 @@ _engine = None
 _Session: async_sessionmaker[AsyncSession] | None = None
 
 
+def _tune_sqlite(engine) -> None:
+    """WAL + NORMAL sync + a real busy timeout. Without these, concurrent agent writes
+    serialise on the default rollback journal and throw 'database is locked'."""
+    from sqlalchemy import event as _event
+
+    @_event.listens_for(engine.sync_engine, "connect")
+    def _set_pragmas(dbapi_conn, _rec):  # pragma: no cover - driver level
+        try:
+            cur = dbapi_conn.cursor()
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA synchronous=NORMAL")
+            cur.execute("PRAGMA busy_timeout=10000")
+            cur.execute("PRAGMA temp_store=MEMORY")
+            cur.execute("PRAGMA cache_size=-32000")
+            cur.execute("PRAGMA foreign_keys=ON")
+            cur.close()
+        except Exception as e:
+            log.debug("sqlite pragma setup skipped: %s", e)
+
+
 def get_engine():
     global _engine, _Session
     if _engine is None:
@@ -335,7 +767,16 @@ def get_engine():
         if url.startswith("sqlite+aiosqlite://"):
             f = url.split("sqlite+aiosqlite://", 1)[1].split("?")[0]
             Path(f).parent.mkdir(parents=True, exist_ok=True)
-        _engine = create_async_engine(url, echo=False, future=True)
+        if url.startswith("sqlite"):
+            _engine = create_async_engine(url, echo=False, future=True,
+                                          pool_pre_ping=True, connect_args={"timeout": 30})
+            _tune_sqlite(_engine)
+        else:
+            _engine = create_async_engine(
+                url, echo=False, future=True, pool_pre_ping=True,
+                pool_size=int(_env("DB_POOL_SIZE", "20")),
+                max_overflow=int(_env("DB_MAX_OVERFLOW", "10")),
+                pool_recycle=1800)
         _Session = async_sessionmaker(_engine, class_=AsyncSession, expire_on_commit=False)
     return _engine
 
@@ -629,6 +1070,8 @@ class KeyCreate(BaseModel):
 
 
 class ChatIn(BaseModel):
+    mode: str = "auto"                       # auto | chat | task
+    history: list[dict] = []
     project_id: str
     message: str
 
@@ -668,6 +1111,7 @@ class AgentMessage(BaseModel):
 class AgentDefinition(BaseModel):
     id: str
     name: str
+    domain: str = "general"
     description: str = ""
     capabilities: list[str] = []
     tools: list[str] = []
@@ -677,6 +1121,7 @@ class AgentDefinition(BaseModel):
     permissions: list[str] = []
     system_instructions: str = ""
     verification_strategy: str = "quality"
+    human_gate: bool = False
     version: str = "1.0"
 
 
@@ -687,6 +1132,7 @@ class AgentContext:
     task_id: str
     node_id: str = "root"
     memory_snippets: list[str] = field(default_factory=list)
+    upstream: dict = field(default_factory=dict)
     artifacts: list[str] = field(default_factory=list)
     budget_tokens: int = 120000
     budget_usd: float = 5.0
@@ -770,37 +1216,333 @@ AGENT_DEFS: list[dict] = [
          system_instructions="You verify all acceptance criteria are met and summarize what was delivered.", verification_strategy="completion"),
 ]
 
-REGISTRY: dict[str, AgentDefinition] = {d["id"]: AgentDefinition(**d) for d in AGENT_DEFS}
+# ---- Catalogue loader: 400+ agents live in agents.json, not in code ----
+AGENT_CATALOGUE_PATH = Path(_env("AGENT_CATALOGUE", str(BASE_DIR / "agents.json")))
+
+REGISTRY: dict[str, AgentDefinition] = {}
+ALIASES: dict[str, str] = {}
+CAP_INDEX: dict[str, set[str]] = defaultdict(set)      # capability -> agent ids
+DOMAIN_INDEX: dict[str, set[str]] = defaultdict(set)   # domain -> agent ids
+TOKEN_INDEX: dict[str, set[str]] = defaultdict(set)    # word -> agent ids
+AGENT_TOKENS: dict[str, set[str]] = {}                 # agent id -> its own words
 
 
-def registry_search(q: str) -> list[AgentDefinition]:
-    q = q.lower()
-    return [d for d in REGISTRY.values()
-            if q in d.id or q in d.name.lower() or any(q in c.lower() for c in d.capabilities)]
+def _index_agent(d: AgentDefinition) -> None:
+    for c in d.capabilities:
+        CAP_INDEX[c.lower()].add(d.id)
+    DOMAIN_INDEX[d.domain.lower()].add(d.id)
+    words = re.findall(r"[a-z0-9]+", f"{d.id} {d.name} {d.domain} {' '.join(d.capabilities)}".lower())
+    keep = {w for w in words if len(w) > 2}
+    AGENT_TOKENS[d.id] = keep
+    for w in keep:
+        TOKEN_INDEX[w].add(d.id)
+
+
+def load_catalogue(path: Path | None = None) -> int:
+    """Load agent definitions from disk. Falls back to the built-in core set."""
+    global ALIASES
+    REGISTRY.clear(); CAP_INDEX.clear(); DOMAIN_INDEX.clear(); TOKEN_INDEX.clear(); AGENT_TOKENS.clear()
+    ALIASES = {}
+    p = path or AGENT_CATALOGUE_PATH
+    loaded = 0
+    if p.exists():
+        try:
+            raw = json.loads(p.read_text())
+            for rec in raw.get("agents", []):
+                try:
+                    d = AgentDefinition(**rec)
+                except Exception as e:
+                    log.warning("skipping malformed agent %s: %s", rec.get("id"), e)
+                    continue
+                REGISTRY[d.id] = d
+                _index_agent(d)
+                loaded += 1
+            ALIASES = {k: v for k, v in raw.get("aliases", {}).items() if v in REGISTRY}
+        except Exception as e:
+            log.error("agent catalogue %s unreadable: %s", p, e)
+    # built-in core agents always present (as fallbacks / short ids)
+    for rec in AGENT_DEFS:
+        if rec["id"] in ALIASES:
+            continue
+        if rec["id"] not in REGISTRY:
+            d = AgentDefinition(**rec)
+            REGISTRY[d.id] = d
+            _index_agent(d)
+            loaded += 1
+    return loaded
+
+
+def resolve_agent(agent_id: str) -> AgentDefinition | None:
+    """Resolve a short id, alias or full id to a definition."""
+    if agent_id in REGISTRY:
+        return REGISTRY[agent_id]
+    target = ALIASES.get(agent_id)
+    if target and target in REGISTRY:
+        return REGISTRY[target]
+    return None
+
+
+load_catalogue()
+
+
+def registry_search(q: str, limit: int = 100) -> list[AgentDefinition]:
+    """Index-backed search so 480 agents stay cheap to query."""
+    q = (q or "").lower().strip()
+    if not q:
+        return list(REGISTRY.values())[:limit]
+    words = [w for w in re.findall(r"[a-z0-9]+", q) if len(w) > 2]
+    hits: dict[str, int] = defaultdict(int)
+    for w in words:
+        for aid in TOKEN_INDEX.get(w, ()):
+            hits[aid] += 2
+        for token, ids in TOKEN_INDEX.items():   # prefix match
+            if token.startswith(w) and token != w:
+                for aid in ids:
+                    hits[aid] += 1
+    if not hits:
+        return [d for d in REGISTRY.values() if q in d.id or q in d.name.lower()][:limit]
+    ranked = sorted(hits.items(), key=lambda kv: -kv[1])[:limit]
+    return [REGISTRY[a] for a, _ in ranked if a in REGISTRY]
+
+
+# =====================================================================================
+# 6b. Deliberation engine — structured multi-pass reasoning
+# =====================================================================================
+# Depth is a dial, not a constant: trivial nodes get one pass, hard ones get the full
+# understand -> plan -> draft -> critique -> revise cycle. Only safe phase summaries are
+# streamed; the model's internal reasoning is never emitted to clients or logs.
+THINK_DEPTH = int(_env("THINK_DEPTH", "3"))          # 0=single pass .. 4=full deliberation
+THINK_MAX_DEPTH = 4
+
+
+class Phase(str, Enum):
+    UNDERSTAND = "UNDERSTAND"
+    PLAN = "PLAN"
+    TOOL_CALL = "TOOL_CALL"
+    OBSERVE = "OBSERVE"
+    ACT = "ACT"
+    CRITIQUE = "CRITIQUE"
+    REVISE = "REVISE"
+    VERIFY = "VERIFY"
+    COMPLETE = "COMPLETE"
+
+
+PHASE_SUMMARY = {
+    Phase.UNDERSTAND: "reading the goal and pinning down assumptions",
+    Phase.PLAN: "choosing an approach",
+    Phase.TOOL_CALL: "calling tools",
+    Phase.OBSERVE: "reading tool results",
+    Phase.ACT: "producing the deliverable",
+    Phase.CRITIQUE: "checking its own work for gaps",
+    Phase.REVISE: "applying fixes it found",
+    Phase.VERIFY: "verifying against acceptance criteria",
+    Phase.COMPLETE: "done",
+}
+
+UNDERSTAND_PROMPT = """Before answering, establish the ground truth of this task.
+Return STRICT JSON only:
+{"restated_goal": "...", "deliverable": "what concretely must exist when done",
+ "assumptions": ["..."], "unknowns": ["things you cannot determine from the input"],
+ "acceptance_criteria": ["checkable conditions"], "risks": ["..."]}"""
+
+PLAN_PROMPT = """Given your understanding, choose an approach.
+Return STRICT JSON only:
+{"approach": "one paragraph", "steps": ["ordered steps"],
+ "rejected_alternatives": [{"option": "...", "why_not": "..."}],
+ "needs_tools": ["tool names or empty"],
+ "subtasks": [{"agent": "agent id or capability", "description": "work you cannot do yourself"}]}
+
+Only list subtasks for work that genuinely belongs to a different specialist. An empty
+list is the normal and correct answer."""
+
+CRITIQUE_PROMPT = """You are reviewing the draft below as a hostile expert reviewer.
+Find real problems, not stylistic nitpicks. If the draft is genuinely sound, say so.
+Return STRICT JSON only:
+{"verdict": "accept" | "revise", "severity": "none"|"minor"|"major",
+ "issues": [{"problem": "...", "why_it_matters": "...", "fix": "concrete instruction"}],
+ "missing": ["anything the acceptance criteria require but the draft lacks"]}"""
+
+REVISE_PROMPT = """Rewrite the deliverable so every issue below is fixed.
+Output ONLY the corrected deliverable. Do not describe the changes, do not apologise."""
+
+
+def _safe_json(text: str) -> dict | None:
+    """Models wrap JSON in prose and fences. Recover it without trusting the format."""
+    if not text:
+        return None
+    t = text.strip()
+    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t, flags=re.MULTILINE).strip()
+    try:
+        v = json.loads(t)
+        return v if isinstance(v, dict) else None
+    except Exception:
+        pass
+    depth, start = 0, -1
+    for i, ch in enumerate(t):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                try:
+                    v = json.loads(t[start:i + 1])
+                    if isinstance(v, dict):
+                        return v
+                except Exception:
+                    start = -1
+    return None
+
+
+def depth_for(node: dict, defn: AgentDefinition) -> int:
+    """Hard, risky or verification work earns more passes. Cheap lookups do not."""
+    d = THINK_DEPTH
+    if defn.risk_level == "high" or defn.verification_strategy in ("security", "code", "tests"):
+        d += 1
+    if defn.cost_level == "low" and defn.risk_level == "low":
+        d -= 1
+    if node.get("attempts", 0) > 1:
+        d += 1                                  # a retry means the first attempt was wrong
+    c = float(node.get("complexity", 0.0) or 0.0)
+    if c >= 0.35:
+        d += 1                                  # hard goals earn a critique pass
+    elif c <= 0.08 and defn.risk_level == "low":
+        d -= 1                                  # trivial goals do not need five calls
+    return max(0, min(THINK_MAX_DEPTH, d))
 
 
 class GenericAgent:
-    """One runtime class driven by the definition. No per-agent services."""
+    """One runtime class driven by a definition. No per-agent services, 480 behaviours."""
 
     def __init__(self, definition: AgentDefinition):
         self.definition = definition
 
-    async def run(self, ctx: AgentContext, deps) -> AgentResult:
-        system = self.definition.system_instructions or f"You are {self.definition.name}. {self.definition.description}"
-        mem = "\n".join(ctx.memory_snippets[:5])
-        messages = build_messages(system, f"{ctx.goal}\n\n<context>\n{mem}\n</context>")
+    def _system(self) -> str:
+        return (self.definition.system_instructions
+                or f"You are {self.definition.name}. {self.definition.description}")
+
+    async def _call(self, deps, messages: list[dict], cap: str, max_tokens: int,
+                    ctx: AgentContext, label: str) -> tuple[str, int, float, str]:
+        """One model call. Returns (text, tokens, usd, model)."""
+        resp = await deps.omni.complete(messages, capability=cap, max_tokens=max_tokens,
+                                        timeout_s=int(_env("AGENT_CALL_TIMEOUT_S", "45")),
+                                        cache_key_extra=f"{self.definition.id}:{label}")
+        text = (resp.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+        usage = resp.get("usage") or {}
+        tokens = int(usage.get("total_tokens") or (len(text) // 4) + 1)
+        return text, tokens, float(resp.get("_cost_usd", 0.0)), str(resp.get("model", ""))
+
+    async def run(self, ctx: AgentContext, deps, node: dict | None = None,
+                  emit_phase=None) -> AgentResult:
+        node = node or {}
+        depth = depth_for(node, self.definition)
         cap = (self.definition.model_requirements or {}).get("capability", "general")
+        system = self._system()
+        mem = "\n".join(ctx.memory_snippets[:5])
+        upstream = json.dumps(ctx.upstream, ensure_ascii=False)[:4000] if getattr(ctx, "upstream", None) else ""
+        base_user = (f"GOAL\n{ctx.goal}\n\n"
+                     + (f"CONTEXT FROM MEMORY\n{mem}\n\n" if mem else "")
+                     + (f"STRUCTURED INPUT FROM UPSTREAM AGENTS\n{upstream}\n\n" if upstream else ""))
+
+        tokens = 0
+        cost = 0.0
+        model_used = ""
+        understanding: dict = {}
+        plan: dict = {}
+        critique: dict = {}
+        offline_reason = ""
+
+        async def phase(p: Phase) -> None:
+            if emit_phase:
+                await emit_phase(p.value, PHASE_SUMMARY[p])
+
         try:
-            resp = await deps.omni.complete(messages, capability=cap, max_tokens=2000, timeout_s=15)
-            text = resp["choices"][0]["message"]["content"]
-            usage = resp.get("usage", {})
-            tokens = int(usage.get("total_tokens", len(text) // 4))
-        except Exception as e:  # offline fallback: deterministic local output
-            text = f"[{self.definition.id}] local-plan for: {ctx.goal[:300]} (omniroute unavailable: {str(e)[:120]})"
-            tokens = max(1, len(text) // 4)
-        return AgentResult(status="completed",
-                           structured_output={"agent": self.definition.id, "node": ctx.node_id, "output": text},
-                           summary=text[:2000], usage_tokens=tokens, usage_usd=0.0)
+            # --- 1. UNDERSTAND -------------------------------------------------
+            if depth >= 2:
+                await phase(Phase.UNDERSTAND)
+                txt, t, c, m = await self._call(
+                    deps, build_messages(system, base_user + UNDERSTAND_PROMPT), cap, 700, ctx, "understand")
+                tokens += t; cost += c; model_used = m or model_used
+                understanding = _safe_json(txt) or {"restated_goal": ctx.goal}
+
+            # --- 2. PLAN -------------------------------------------------------
+            if depth >= 3:
+                await phase(Phase.PLAN)
+                ptxt, t, c, m = await self._call(
+                    deps, build_messages(system, base_user
+                                         + f"YOUR UNDERSTANDING\n{json.dumps(understanding)[:2000]}\n\n"
+                                         + PLAN_PROMPT), cap, 700, ctx, "plan")
+                tokens += t; cost += c; model_used = m or model_used
+                plan = _safe_json(ptxt) or {}
+
+            # --- 3. ACT --------------------------------------------------------
+            await phase(Phase.ACT)
+            act_user = base_user
+            if understanding:
+                act_user += f"AGREED UNDERSTANDING\n{json.dumps(understanding)[:2000]}\n\n"
+            if plan:
+                act_user += f"AGREED APPROACH\n{json.dumps(plan)[:2000]}\n\n"
+            act_user += ("Produce the deliverable itself now. Be concrete and complete. "
+                         "State any assumption you had to make inline, and mark anything "
+                         "you could not verify as an explicit open question.")
+            draft, t, c, m = await self._call(
+                deps, build_messages(system, act_user), cap,
+                int(_env("AGENT_MAX_OUTPUT_TOKENS", "2400")), ctx, "act")
+            tokens += t; cost += c; model_used = m or model_used
+
+            # --- 4. CRITIQUE + REVISE ------------------------------------------
+            if depth >= 4 and draft.strip():
+                await phase(Phase.CRITIQUE)
+                crit_user = (f"ACCEPTANCE CRITERIA\n"
+                             f"{json.dumps(understanding.get('acceptance_criteria', []))}\n\n"
+                             f"DRAFT\n{draft[:6000]}\n\n{CRITIQUE_PROMPT}")
+                ctxt, t, c, _ = await self._call(
+                    deps, build_messages(system, crit_user), "reasoning", 800, ctx, "critique")
+                tokens += t; cost += c
+                critique = _safe_json(ctxt) or {}
+                if critique.get("verdict") == "revise" and critique.get("issues"):
+                    await phase(Phase.REVISE)
+                    rev_user = (f"ISSUES TO FIX\n{json.dumps(critique['issues'])[:3000]}\n\n"
+                                f"MISSING\n{json.dumps(critique.get('missing', []))[:1000]}\n\n"
+                                f"CURRENT DRAFT\n{draft[:6000]}\n\n{REVISE_PROMPT}")
+                    revised, t, c, _ = await self._call(
+                        deps, build_messages(system, rev_user), cap,
+                        int(_env("AGENT_MAX_OUTPUT_TOKENS", "2400")), ctx, "revise")
+                    tokens += t; cost += c
+                    if revised.strip():
+                        draft = revised
+
+        except Exception as e:
+            # Offline / provider down: deterministic local output so the DAG still completes.
+            offline_reason = redact(str(e))[:160]
+            draft = self._offline_draft(ctx, understanding, plan)
+            tokens = tokens or max(1, len(draft) // 4)
+
+        await phase(Phase.COMPLETE)
+        return AgentResult(
+            status="completed",
+            structured_output={
+                "agent": self.definition.id, "domain": self.definition.domain,
+                "node": ctx.node_id, "deliverable": draft,
+                "understanding": understanding, "plan": plan,
+                "self_review": {"verdict": critique.get("verdict"),
+                                "severity": critique.get("severity"),
+                                "issues_found": len(critique.get("issues", []))} if critique else {},
+                "think_depth": depth, "model": model_used,
+                "offline": bool(offline_reason), "offline_reason": offline_reason,
+            },
+            summary=draft[:4000], usage_tokens=tokens, usage_usd=cost)
+
+    def _offline_draft(self, ctx: AgentContext, understanding: dict, plan: dict) -> str:
+        d = self.definition
+        return (f"[{d.id} | offline deterministic output]\n"
+                f"Role: {d.name} ({d.domain}) — {d.description}\n"
+                f"Goal slice: {ctx.goal[:300]}\n"
+                f"Planned contribution: {', '.join(d.capabilities[:5])}\n"
+                f"Verification strategy: {d.verification_strategy}\n"
+                f"NOTE: no model gateway reachable, so this is a structural placeholder, "
+                f"not real work product.")
 
 
 # ---- Router: goal -> {agents, order, tools, model class, concurrency, budget, verification} ----
@@ -823,59 +1565,467 @@ class RoutePlan:
     concurrency: int = 4
     budget_tokens: int = 120000
     budget_usd: float = 5.0
+    complexity: float = 0.0
 
 
-def _score(defn: AgentDefinition, goal: str, perf: float) -> float:
-    gl = goal.lower()
-    cap_hit = sum(1 for c in defn.capabilities if c.lower() in gl)
-    cap_score = min(1.0, 0.3 + 0.35 * cap_hit)
-    cost_fit = 1.0 - COST_RANK.get(defn.cost_level, 0) * 0.2
-    kw = 1.0 if any(k in gl for k in ("build", "saas", "app", "code", "deploy", "test", "research", "analy")) else 0.5
-    return 0.4 * cap_score + 0.15 * cost_fit + 0.15 * (0.5 + perf / 2) + 0.3 * kw
+# Universal long-horizon lifecycle. Works for software, research, legal, finance,
+# science, marketing — the phases are field-agnostic; the agents inside them are not.
+PHASES = ["analyze", "research", "design", "implement", "verify", "deliver", "synthesize"]
+
+DOMAIN_PHASES: dict[str, set[str]] = {
+    "product_management": {"analyze", "design"},
+    "orchestration": {"analyze", "synthesize"},
+    "research": {"research"},
+    "data_science": {"research", "verify"},
+    "analytics": {"research", "verify"},
+    "scientific_computing": {"research", "implement"},
+    "bioinformatics": {"research", "implement"},
+    "healthcare": {"research", "implement"},
+    "legal": {"research", "verify"},
+    "finance": {"research", "implement"},
+    "accounting": {"implement", "verify"},
+    "software_architecture": {"design"},
+    "ux_design": {"design"},
+    "api_design": {"design"},
+    "database": {"design", "implement"},
+    "backend_engineering": {"implement"},
+    "frontend_engineering": {"implement"},
+    "mobile_engineering": {"implement"},
+    "game_development": {"implement"},
+    "embedded_systems": {"implement"},
+    "data_engineering": {"implement"},
+    "machine_learning": {"implement"},
+    "blockchain": {"implement"},
+    "creative_writing": {"implement"},
+    "media_production": {"implement"},
+    "marketing": {"implement"},
+    "sales": {"implement"},
+    "education": {"implement"},
+    "localization": {"implement"},
+    "operations": {"implement"},
+    "human_resources": {"implement"},
+    "customer_support": {"implement"},
+    "technical_writing": {"implement", "deliver"},
+    "quality_assurance": {"verify"},
+    "security": {"verify"},
+    "privacy_compliance": {"verify"},
+    "devops": {"deliver"},
+    "mlops": {"deliver"},
+    "cloud_infrastructure": {"deliver"},
+    "site_reliability": {"deliver"},
+}
+
+# Signals that a phase is actually wanted for this goal.
+PHASE_SIGNALS: dict[str, tuple[str, ...]] = {
+    "research": ("research", "investigate", "survey", "compare", "evaluate", "study", "find",
+                 "analyse", "analyze", "review", "benchmark", "literature", "market", "explore"),
+    "design": ("design", "architect", "plan", "structure", "schema", "model", "spec", "blueprint",
+               "wireframe", "layout", "strategy"),
+    "implement": ("build", "implement", "write", "create", "code", "develop", "make", "generate",
+                  "produce", "draft", "refactor", "migrate", "automate", "fix"),
+    "verify": ("test", "verify", "validate", "audit", "review", "check", "secure", "qa",
+               "compliance", "correct", "prove"),
+    "deliver": ("deploy", "ship", "release", "launch", "publish", "document", "handover",
+                "rollout", "package", "distribute"),
+}
+
+COMPLEXITY_WORDS = ("production", "end-to-end", "complete", "full", "comprehensive", "entire",
+                    "scalable", "enterprise", "multi", "long-term", "roadmap", "platform", "system")
 
 
-SAAS_PIPE = ["goal_analyzer", "requirements", "architecture", "ui", "frontend", "backend",
-             "database", "ai_integrator", "security", "testing", "devops", "deployment",
-             "critic", "final_verifier"]
-RESEARCH_PIPE = ["goal_analyzer", "researcher", "analyst", "critic", "final_verifier"]
-DEFAULT_PIPE = ["goal_analyzer", "researcher", "analyst", "backend", "testing", "critic", "final_verifier"]
+STOPWORDS = {
+    "the", "and", "for", "with", "that", "this", "from", "into", "our", "your", "you", "are",
+    "was", "has", "have", "can", "will", "would", "should", "make", "made", "get", "got", "any",
+    "all", "some", "more", "most", "very", "just", "like", "also", "but", "not", "its", "their",
+    "them", "they", "his", "her", "who", "what", "when", "where", "how", "why", "which", "there",
+    "then", "than", "about", "over", "under", "out", "off", "one", "two", "new", "old", "own",
+    "use", "using", "used", "need", "want", "please", "help", "give", "let", "set", "put",
+}
+
+# Domain lexicons: what a goal has to sound like for a domain to be in play.
+DOMAIN_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "software_architecture": ("architecture", "architect", "system design", "microservice", "monolith", "scalable", "topology", "boundaries", "adr", "tradeoff"),
+    "backend_engineering": ("backend", "api", "server", "endpoint", "service", "rest", "auth", "authentication", "webhook", "worker", "queue", "saas", "crud", "fastapi", "django", "node", "express"),
+    "frontend_engineering": ("frontend", "ui", "react", "vue", "svelte", "component", "css", "browser", "web", "page", "responsive", "dashboard", "spa", "tailwind"),
+    "mobile_engineering": ("mobile", "ios", "android", "app", "swift", "kotlin", "flutter", "react native", "phone", "tablet"),
+    "game_development": ("game", "gameplay", "unity", "unreal", "player", "level", "npc", "multiplayer", "sprite", "shader"),
+    "embedded_systems": ("embedded", "firmware", "microcontroller", "arduino", "esp32", "rtos", "sensor", "hardware", "iot", "driver"),
+    "data_engineering": ("data pipeline", "etl", "ingestion", "warehouse", "airflow", "spark", "streaming", "kafka", "batch", "lakehouse", "dbt"),
+    "data_science": ("statistics", "statistical", "regression", "correlation", "hypothesis", "distribution", "dataset", "eda", "cohort", "forecast", "experiment"),
+    "machine_learning": ("ml model", "machine learning", "recommendation", "recommender", "recsys", "predictive", "prediction", "classifier", "classification", "train a model", "predictive model", "computer vision", "nlp", "neural", "training", "llm", "embedding", "rag", "finetune", "fine-tune", "classifier", "prompt", "inference", "transformer"),
+    "mlops": ("mlops", "model deployment", "drift", "serving", "feature store", "retraining", "model registry"),
+    "devops": ("ci", "cd", "ci/cd", "jenkins", "github actions", "docker", "build", "release", "deploy", "automation", "devops"),
+    "cloud_infrastructure": ("cloud", "aws", "azure", "gcp", "kubernetes", "terraform", "vpc", "infrastructure", "cdn", "serverless", "k8s"),
+    "site_reliability": ("reliability", "uptime", "incident", "slo", "sla", "oncall", "outage", "monitoring", "alerting", "postmortem", "latency"),
+    "security": ("security", "secure", "vulnerability", "exploit", "threat", "penetration", "xss", "csrf", "injection", "encryption", "hardening", "attack", "breach"),
+    "privacy_compliance": ("privacy", "gdpr", "hipaa", "soc2", "soc 2", "pci", "compliance", "consent", "retention", "dpia", "personal data", "regulation"),
+    "quality_assurance": ("test", "testing", "qa", "pytest", "unit test", "coverage", "flaky", "regression", "e2e", "assertion", "bug"),
+    "database": ("database", "sql", "postgres", "mysql", "schema", "query", "index", "migration", "mongodb", "table", "join", "normalise", "normalize"),
+    "api_design": ("api design", "openapi", "swagger", "graphql", "grpc", "contract", "versioning", "pagination", "sdk", "rate limit"),
+    "product_management": ("product", "requirement", "roadmap", "feature", "user story", "backlog", "prioritise", "prioritize", "mvp", "scope", "stakeholder"),
+    "ux_design": ("ux", "user experience", "wireframe", "usability", "onboarding", "flow", "prototype", "interaction", "accessibility", "design system"),
+    "technical_writing": ("documentation", "docs", "readme", "tutorial", "guide", "manual", "changelog", "reference", "write up", "explain"),
+    "research": ("research", "investigate", "survey", "literature", "paper", "arxiv", "study", "evidence", "source", "citation", "state of the art", "compare", "landscape"),
+    "scientific_computing": ("simulation", "numerical", "physics", "chemistry", "differential", "solver", "matrix", "finite element", "monte carlo", "hpc", "climate"),
+    "bioinformatics": ("genome", "genomic", "dna", "rna", "sequencing", "protein", "variant", "bioinformatics", "microbiome", "phylogen"),
+    "healthcare": ("clinical", "patient", "medical", "health", "diagnosis", "treatment", "hospital", "fhir", "icd", "trial", "physician"),
+    "legal": ("legal", "contract", "clause", "law", "litigation", "liability", "intellectual property", "licence", "license", "terms of service", "nda", "attorney", "statute"),
+    "finance": ("financial", "finance", "valuation", "revenue", "dcf", "investment", "cashflow", "cash flow", "runway", "budget", "margin", "forecast", "pricing", "portfolio", "unit economics"),
+    "accounting": ("accounting", "ledger", "bookkeeping", "reconcile", "reconciliation", "payroll", "tax", "invoice", "financial audit", "balance sheet", "depreciation"),
+    "marketing": ("marketing", "campaign", "seo", "brand", "copy", "content", "advertis", "social media", "newsletter", "funnel", "growth", "positioning", "landing page"),
+    "sales": ("sales", "prospect", "sales lead", "outreach", "crm", "sales pipeline", "proposal", "rfp", "quota", "negotiat", "cold email", "closing"),
+    "customer_support": ("support ticket", "customer support", "helpdesk", "ticket", "escalation", "knowledge base", "faq", "churn", "csat"),
+    "human_resources": ("hiring", "recruit", "candidate", "interview", "employee", "onboarding plan", "compensation", "performance review", "hr", "job description"),
+    "operations": ("operations", "process", "sop", "workflow", "logistics", "inventory", "supply", "procurement", "vendor", "scheduling", "throughput"),
+    "analytics": ("analytics", "metric", "kpi", "dashboard", "report", "funnel", "attribution", "tracking", "insight", "bi"),
+    "creative_writing": ("story", "novel", "fiction", "character", "plot", "screenplay", "poem", "poetry", "essay", "narrative", "script", "dialogue", "fantasy", "chapter"),
+    "media_production": ("video", "podcast", "audio", "film", "footage", "subtitle", "storyboard", "edit", "youtube", "livestream", "voiceover"),
+    "education": ("teach", "learn", "curriculum", "lesson", "course", "student", "exam", "quiz", "tutor", "syllabus", "explain concept", "training material"),
+    "blockchain": ("blockchain", "smart contract", "solidity", "ethereum", "token", "defi", "wallet", "onchain", "on-chain", "nft", "crypto"),
+    "localization": ("translate", "translation", "localis", "localiz", "multilingual", "locale", "language support", "rtl", "i18n"),
+    "orchestration": ("plan", "orchestrat", "coordinate", "decompose", "delegate", "workflow of agents", "verify", "critique"),
+}
+
+_DOMAIN_KW_INDEX: dict[str, list[str]] = {d: list(k) for d, k in DOMAIN_KEYWORDS.items()}
+
+
+# A live domain implies its neighbours: you cannot build an app with only a backend.
+DOMAIN_COMPANIONS: dict[str, tuple[str, ...]] = {
+    "backend_engineering": ("database", "api_design", "quality_assurance", "security", "frontend_engineering"),
+    "frontend_engineering": ("ux_design", "quality_assurance", "backend_engineering"),
+    "mobile_engineering": ("ux_design", "quality_assurance", "backend_engineering"),
+    "machine_learning": ("data_engineering", "mlops", "data_science"),
+    "mlops": ("machine_learning", "devops", "site_reliability"),
+    "data_engineering": ("database", "data_science", "quality_assurance"),
+    "devops": ("cloud_infrastructure", "site_reliability", "security"),
+    "cloud_infrastructure": ("devops", "security", "site_reliability"),
+    "blockchain": ("security", "quality_assurance"),
+    "game_development": ("quality_assurance", "ux_design"),
+    "embedded_systems": ("quality_assurance", "security"),
+    "healthcare": ("privacy_compliance", "research"),
+    "legal": ("privacy_compliance", "research"),
+    "finance": ("accounting", "analytics"),
+    "accounting": ("finance",),
+    "marketing": ("analytics", "technical_writing"),
+    "creative_writing": ("technical_writing",),
+    "localization": ("technical_writing", "quality_assurance"),
+    "education": ("technical_writing",),
+    "security": ("privacy_compliance", "quality_assurance"),
+    "research": ("analytics",),
+}
+
+
+def domain_affinity(goal: str) -> dict[str, float]:
+    """Which domains is this goal actually about? Normalised 0..1."""
+    gl = (goal or "").lower()
+    toks = set(_goal_tokens(goal))
+    raw: dict[str, float] = {}
+    for dom, kws in _DOMAIN_KW_INDEX.items():
+        score = 0.0
+        for kw in kws:
+            if " " in kw:
+                if kw in gl:
+                    score += 2.5           # multi-word phrases are strong evidence
+            elif kw in toks:
+                score += 1.5
+            elif len(kw) > 5 and any(t.startswith(kw[:5]) and len(t) > 4 for t in toks):
+                score += 0.5               # conservative stem match
+        if score:
+            raw[dom] = score
+    if not raw:
+        return {}
+    # pull in companion domains at reduced weight so plans are complete, not lopsided
+    for dom, v in list(raw.items()):
+        if v >= 0.6 * max(raw.values()):
+            for comp in DOMAIN_COMPANIONS.get(dom, ()):
+                raw[comp] = max(raw.get(comp, 0.0), v * 0.45)
+    top = max(raw.values())
+    return {d: round(v / top, 4) for d, v in raw.items()}
+
+
+def _goal_tokens(goal: str) -> list[str]:
+    return [w for w in re.findall(r"[a-z0-9]+", (goal or "").lower())
+            if len(w) > 2 and w not in STOPWORDS]
+
+
+def goal_complexity(goal: str) -> float:
+    """0..1 — drives how many agents and how much parallelism the plan gets."""
+    toks = _goal_tokens(goal)
+    score = min(1.0, len(toks) / 40.0) * 0.4
+    score += min(1.0, sum(1 for w in COMPLEXITY_WORDS if w in goal.lower()) / 4.0) * 0.4
+    score += min(1.0, goal.count(",") / 6.0) * 0.2
+    return round(min(1.0, score), 3)
+
+
+def _candidates(goal: str) -> dict[str, int]:
+    """Cheap inverted-index lookup — never scans all 480 definitions."""
+    hits: dict[str, int] = defaultdict(int)
+    for w in _goal_tokens(goal):
+        for aid in TOKEN_INDEX.get(w, ()):
+            hits[aid] += 3
+    return hits
+
+
+def _score(defn: AgentDefinition, goal: str, perf: float, raw_hit: int = 0,
+           budget_usd: float = 5.0, dom_aff: dict[str, float] | None = None) -> float:
+    """Domain affinity first, then role match, cost fit and measured performance."""
+    dom_aff = dom_aff or {}
+    domain_score = dom_aff.get(defn.domain, 0.0)
+    gl = (goal or "").lower()
+    cap_hit = sum(1 for c in defn.capabilities if len(c) > 3 and c.lower() in gl)
+    # stem overlap catches translate/translator, deploy/deployment, test/testing
+    gstems = {t[:5] for t in _goal_tokens(goal)}
+    astems = {t[:5] for t in AGENT_TOKENS.get(defn.id, ())}
+    stem_hits = len(gstems & astems)
+    role_part = defn.id.split(".", 1)[-1]
+    rstems = {t[:5] for t in re.findall(r"[a-z0-9]+", f"{role_part} {defn.name}".lower()) if len(t) > 2}
+    role_hits = len(gstems & rstems)     # matched the specific role, not just the domain
+    role_score = min(1.0, 0.22 * cap_hit + 0.12 * stem_hits + 0.30 * role_hits + 0.04 * min(raw_hit, 4))
+    cost_rank = COST_RANK.get(defn.cost_level, 0)
+    cost_fit = 1.0 - cost_rank * (0.35 if budget_usd < 1.0 else 0.15)
+    risk_penalty = 0.08 * COST_RANK.get(defn.risk_level, 0)
+    return round(0.45 * domain_score + 0.35 * role_score
+                 + 0.08 * cost_fit + 0.12 * perf - risk_penalty, 5)
+
+
+def _phase_width(phase: str, complexity: float) -> int:
+    base = {"analyze": 2, "research": 3, "design": 3, "implement": 5,
+            "verify": 3, "deliver": 2, "synthesize": 2}[phase]
+    return max(1, int(round(base * (0.7 + complexity))))
+
+
+BUILD_WORDS = ("build", "create", "develop", "implement", "production", "ship", "launch",
+               "end-to-end", "full", "complete", "platform", "application", "system", "product")
+
+
+def active_phases(goal: str, dom_aff: dict[str, float] | None = None) -> list[str]:
+    """A phase is active if the wording asks for it, or a live domain needs it."""
+    gl = (goal or "").lower()
+    active = {"analyze", "synthesize"}                      # always
+    for phase, signals in PHASE_SIGNALS.items():
+        if any(sig in gl for sig in signals):
+            active.add(phase)
+    # domains the goal is about bring their own phases with them
+    dom_aff = dom_aff if dom_aff is not None else domain_affinity(goal)
+    for dom, v in dom_aff.items():
+        if v >= 0.60 and dom != "orchestration":
+            active |= DOMAIN_PHASES.get(dom, {"implement"})
+    if active <= {"analyze", "synthesize"}:
+        active |= {"research", "implement", "verify"}
+    if any(w in gl for w in BUILD_WORDS):                    # real build => design + handover
+        active |= {"design", "implement", "verify", "deliver"}
+    if "implement" in active:
+        active.add("verify")                                 # never ship unverified work
+    return [p for p in PHASES if p in active]
 
 
 def route_goal(goal: str, perf_map: dict[str, float] | None = None,
-               budget_tokens: int = 120000, budget_usd: float = 5.0) -> RoutePlan:
+               budget_tokens: int = 120000, budget_usd: float = 5.0,
+               max_agents: int = 24) -> RoutePlan:
+    """Select agents by capability match across the whole catalogue, in any field."""
     perf_map = perf_map or {}
-    gl = goal.lower()
-    if any(k in gl for k in ("saas", "application", "platform", "frontend", "backend", "deploy")):
-        pipe = SAAS_PIPE
-    elif any(k in gl for k in ("research", "analy", "report", "paper", "survey")):
-        pipe = RESEARCH_PIPE
-    else:
-        ranked = sorted(REGISTRY.values(), key=lambda d: _score(d, goal, perf_map.get(d.id, 0.5)), reverse=True)
-        pipe = [d.id for d in ranked[:6]] or DEFAULT_PIPE
-    pipe = [a for a in pipe if a in REGISTRY] or list(REGISTRY)[:3]
-    steps: list[RouteStep] = []
-    prev: str | None = None
-    anchor: str | None = None
-    parallel = {"frontend", "backend", "database", "ai_integrator", "ui"}
-    for i, aid in enumerate(pipe):
+    complexity = goal_complexity(goal)
+    dom_aff = domain_affinity(goal)
+    phases = active_phases(goal, dom_aff)
+    hits = _candidates(goal)
+
+    # candidate pool = agents in domains the goal is about, plus direct token hits
+    live_domains = {d for d, v in dom_aff.items() if v >= 0.30} | {"orchestration"}
+    pool: dict[str, int] = {}
+    for dom in live_domains:
+        for aid in DOMAIN_INDEX.get(dom, ()):
+            pool[aid] = hits.get(aid, 0)
+    if len(pool) <= len(DOMAIN_INDEX.get("orchestration", ())):
+        # no domain read confidently — fall back to raw token hits, then everything
+        pool = {aid: h for aid, h in hits.items() if aid in REGISTRY} or {aid: 0 for aid in REGISTRY}
+
+    by_phase: dict[str, list[tuple[float, AgentDefinition]]] = {p: [] for p in phases}
+    for aid, raw in pool.items():
         d = REGISTRY[aid]
-        deps: list[str] = []
-        if aid in parallel and anchor:
-            deps = [anchor]
-        elif prev:
-            deps = [prev]
-        if aid == "architecture":
-            anchor = f"n{i}"
-        steps.append(RouteStep(node_id=f"n{i}", agent_id=aid, depends_on=deps, tools=d.tools,
-                               capability=(d.model_requirements or {}).get("capability", "general"),
-                               verification=d.verification_strategy))
-        if aid not in parallel:
-            prev = f"n{i}"
-    return RoutePlan(steps=steps, concurrency=4, budget_tokens=budget_tokens, budget_usd=budget_usd)
+        sc = _score(d, goal, perf_map.get(aid, 0.5), raw, budget_usd, dom_aff)
+        for p in DOMAIN_PHASES.get(d.domain, {"implement"}) & set(phases):
+            by_phase[p].append((sc, d))
+
+    # orchestration spine — always present, regardless of keyword match
+    spine = {
+        "analyze": ["orchestration.goal_decomposer", "product_management.goal_analyzer"],
+        "synthesize": ["orchestration.critic", "orchestration.final_verifier"],
+    }
+
+    steps: list[RouteStep] = []
+    prev_layer: list[str] = []
+    idx = 0
+    selected: set[str] = set()
+
+    for phase in phases:
+        width = _phase_width(phase, complexity)
+        chosen: list[AgentDefinition] = []
+        for forced in spine.get(phase, []):
+            d = resolve_agent(forced)
+            if d and d.id not in selected:
+                chosen.append(d); selected.add(d.id)
+        ranked = sorted(by_phase.get(phase, []), key=lambda t: -t[0])
+        for sc, d in ranked:
+            if len(chosen) >= width or len(selected) >= max_agents:
+                break
+            if d.id in selected:
+                continue
+            chosen.append(d); selected.add(d.id)
+        if not chosen:
+            continue
+        layer: list[str] = []
+        for d in chosen:
+            nid = f"n{idx}"; idx += 1
+            steps.append(RouteStep(
+                node_id=nid, agent_id=d.id, depends_on=list(prev_layer), tools=d.tools,
+                capability=(d.model_requirements or {}).get("capability", "general"),
+                verification=d.verification_strategy))
+            layer.append(nid)
+        prev_layer = layer
+
+    if not steps:   # never return an empty plan
+        d = resolve_agent("orchestration.goal_decomposer") or next(iter(REGISTRY.values()))
+        steps = [RouteStep(node_id="n0", agent_id=d.id, depends_on=[], tools=d.tools,
+                           capability="general", verification=d.verification_strategy)]
+
+    concurrency = max(2, min(8, int(round(2 + complexity * 6))))
+    return RoutePlan(steps=steps, concurrency=concurrency, budget_tokens=budget_tokens,
+                     budget_usd=budget_usd, complexity=complexity)
+
+
+# =====================================================================================
+# 5b. Intent routing — not every message deserves a 16-agent task graph
+# =====================================================================================
+# "hi" must not spawn a DAG. A conversational turn takes one model call and returns in
+# well under a second; only genuine work is promoted to the long-horizon orchestrator.
+
+CHAT_MAX_WORDS = int(_env("CHAT_MAX_WORDS", "40"))
+
+GREETING_RE = re.compile(
+    r"^(hi|hey|hello|yo|sup|howdy|good (morning|afternoon|evening)|thanks?|thank you|"
+    r"ty|ok|okay|cool|nice|great|bye|goodbye|see ya|gm|gn)\b[\s!.,?]*$", re.I)
+
+# Asking *about* something is conversation. Asking *for* something built is a task.
+TASK_VERBS = (
+    "build", "create", "implement", "develop", "design", "write", "draft", "generate",
+    "produce", "refactor", "migrate", "deploy", "audit", "review", "analyse", "analyze",
+    "research", "investigate", "compare", "evaluate", "plan", "architect", "optimise",
+    "optimize", "debug", "fix", "test", "translate", "summarise", "summarize", "automate",
+    "scaffold", "set up", "integrate", "benchmark", "model", "forecast", "reconcile",
+)
+TASK_NOUNS = (
+    "application", "app", "platform", "system", "pipeline", "report", "dashboard",
+    "api", "service", "database", "schema", "test suite", "roadmap", "strategy",
+    "architecture", "migration", "deployment", "curriculum", "model", "codebase",
+    "repository", "documentation", "spec", "proposal", "contract", "analysis",
+    "tests", "test", "bug", "bugs", "ci", "pipeline", "website", "site", "script",
+    "server", "backend", "frontend", "feature", "module", "component", "config",
+)
+QUESTION_STARTS = ("what", "who", "when", "where", "why", "how", "which", "is", "are",
+                   "was", "were", "do", "does", "did", "can", "could", "should", "would",
+                   "will", "explain", "tell me", "define")
+
+
+def classify_intent(message: str) -> dict:
+    """Decide between a fast conversational reply and a full orchestrated task.
+
+    Returns {mode, confidence, reason, complexity}. `mode` is "chat" or "task".
+    """
+    msg = (message or "").strip()
+    if not msg:
+        return {"mode": "chat", "confidence": 1.0, "reason": "empty message", "complexity": 0.0}
+
+    low = msg.lower()
+    words = re.findall(r"[a-z0-9']+", low)
+    n = len(words) or len(msg.split())          # CJK and other scripts tokenise to nothing
+    complexity = goal_complexity(msg)
+
+    if GREETING_RE.match(msg):
+        return {"mode": "chat", "confidence": 1.0, "reason": "greeting or acknowledgement",
+                "complexity": complexity}
+
+    # explicit override wins over every heuristic
+    if low.startswith(("/task", "!task")):
+        return {"mode": "task", "confidence": 1.0, "reason": "explicit /task prefix",
+                "complexity": max(complexity, 0.5)}
+    if low.startswith(("/chat", "!chat")):
+        return {"mode": "chat", "confidence": 1.0, "reason": "explicit /chat prefix",
+                "complexity": complexity}
+
+    has_verb = any(re.search(rf"\b{re.escape(v)}\b", low) for v in TASK_VERBS)
+    has_noun = any(nn in low for nn in TASK_NOUNS)
+    is_question = (bool(words) and words[0] in QUESTION_STARTS) or msg.rstrip().endswith("?")
+    multi_part = msg.count(",") >= 2 or " and " in low or msg.count("\n") >= 2
+
+    starts_imperative = bool(words) and words[0] in TASK_VERBS
+    score = 0.0
+    if has_verb:
+        score += 0.45
+    if starts_imperative:
+        score += 0.20                       # "fix the tests" is an order, not a question
+    if has_noun:
+        score += 0.25
+    if multi_part:
+        score += 0.15
+    if n > CHAT_MAX_WORDS:
+        score += 0.25
+    if complexity >= 0.25:
+        score += 0.20
+    # A plain question is conversation even when it mentions a task noun:
+    # "what is a good database schema?" is a question, "design a database schema" is work.
+    if is_question and not has_verb:
+        score -= 0.45
+    if n <= 6 and not has_verb:
+        score -= 0.35
+
+    if score >= 0.5:
+        return {"mode": "task", "confidence": round(min(1.0, score), 2),
+                "reason": "requests work to be produced", "complexity": complexity}
+    return {"mode": "chat", "confidence": round(min(1.0, 1.0 - score), 2),
+            "reason": "conversational turn", "complexity": complexity}
+
+
+FAST_SYSTEM = (
+    "You are Maximus, a direct and knowledgeable assistant. Answer the message plainly "
+    "and concisely. Do not announce what you are about to do, do not pad the answer, and "
+    "do not offer to build anything unless asked. If the request genuinely needs a "
+    "multi-step project, say so in one sentence and stop."
+)
+
+
+async def fast_reply(message: str, history: list[dict] | None = None,
+                     project_id: str = "") -> dict:
+    """Single-call conversational response. No planning, no DAG, no agents."""
+    t0 = time.monotonic()
+    omni = OmniRouteClient()
+    messages = build_messages(FAST_SYSTEM, message, history)
+    try:
+        resp = await omni.complete(messages, capability="cheap", max_tokens=700,
+                                   timeout_s=int(_env("CHAT_TIMEOUT_S", "20")),
+                                   cache_key_extra="fastchat")
+        text = (resp.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+        usage = resp.get("usage") or {}
+        tokens = int(usage.get("total_tokens") or len(text) // 4)
+        cached = bool(resp.get("_cached"))
+    except Exception as e:
+        text = (f"I could not reach a model gateway, so I cannot answer conversationally "
+                f"right now. ({redact(str(e))[:120]})")
+        tokens, cached = 0, False
+    return {"reply": text, "tokens": tokens, "cached": cached,
+            "latency_ms": int((time.monotonic() - t0) * 1000)}
+
+
 
 
 # ---- Planner: RoutePlan -> persistent DAG ----
-HUMAN_GATE_AGENTS = {"deployment", "security", "devops"}
+HUMAN_GATE_AGENTS = {"deployment"}  # legacy short ids
+
+
+def needs_human_gate(agent_id: str) -> bool:
+    d = resolve_agent(agent_id)
+    if d is not None and d.human_gate:
+        return True
+    return agent_id in HUMAN_GATE_AGENTS
 
 
 def plan_to_dag(plan: RoutePlan) -> dict:
@@ -885,11 +2035,60 @@ def plan_to_dag(plan: RoutePlan) -> dict:
             "node_id": s.node_id, "agent_id": s.agent_id, "depends_on": s.depends_on,
             "tools": s.tools, "capability": s.capability, "verification": s.verification,
             "status": "pending", "attempts": 0, "max_retries": 3, "timeout_s": 600,
-            "needs_approval": s.agent_id in HUMAN_GATE_AGENTS,
+            "needs_approval": needs_human_gate(s.agent_id),
+            "complexity": plan.complexity,
             "result": None, "error": None, "started_at": None, "ended_at": None,
         })
     return {"nodes": nodes, "created_at": time.time(), "concurrency": plan.concurrency,
-            "budget_tokens": plan.budget_tokens, "budget_usd": plan.budget_usd}
+            "budget_tokens": plan.budget_tokens, "budget_usd": plan.budget_usd,
+            "deadline_at": time.time() + float(_env("TASK_DEADLINE_S", "86400")),
+            "expansions": 0, "max_expansions": int(_env("MAX_DAG_EXPANSIONS", "3")),
+            "generation": 0}
+
+
+def expand_dag(dag: dict, parent: dict, subtasks: list[dict], goal: str) -> int:
+    """Let an agent add work it discovered mid-run — the core of long-horizon execution.
+
+    Bounded by max_expansions so a task cannot grow without limit.
+    """
+    if dag.get("expansions", 0) >= dag.get("max_expansions", 3):
+        return 0
+    if not subtasks:
+        return 0
+    existing = {n["node_id"] for n in dag["nodes"]}
+    added = 0
+    for st in subtasks[:6]:
+        agent_id = str(st.get("agent") or "").strip()
+        defn = resolve_agent(agent_id)
+        if defn is None:
+            hits = registry_search(str(st.get("description", ""))[:120], limit=1)
+            if not hits:
+                continue
+            defn = hits[0]
+        nid = f"x{dag.get('generation', 0)}_{len(existing) + added}"
+        if nid in existing:
+            continue
+        dag["nodes"].append({
+            "node_id": nid, "agent_id": defn.id,
+            "depends_on": [parent["node_id"]], "tools": defn.tools,
+            "capability": (defn.model_requirements or {}).get("capability", "general"),
+            "verification": defn.verification_strategy, "status": "pending",
+            "attempts": 0, "max_retries": 2, "timeout_s": 600,
+            "needs_approval": needs_human_gate(defn.id),
+            "result": None, "error": None, "started_at": None, "ended_at": None,
+            "spawned_by": parent["node_id"],
+            "subtask": str(st.get("description", ""))[:400],
+        })
+        added += 1
+    if added:
+        dag["expansions"] = dag.get("expansions", 0) + 1
+        dag["generation"] = dag.get("generation", 0) + 1
+    return added
+
+
+def dag_expired(dag: dict) -> bool:
+    dl = dag.get("deadline_at")
+    return bool(dl) and time.time() > float(dl)
 
 
 def ready_nodes(dag: dict) -> list[dict]:
@@ -944,40 +2143,93 @@ async def _emit_safe(deps: Deps, task_id: str, run_id: str | None, typ: str, pay
 async def run_node(node: dict, task: dict, deps: Deps) -> dict:
     task_id, node_id, agent_id = task["id"], node["node_id"], node["agent_id"]
     run_id = f"{task_id}:{node_id}"
-    await _emit_safe(deps, task_id, run_id, "agent_started", {"agent": agent_id, "node": node_id})
+    defn = resolve_agent(agent_id)
+    if defn is None:
+        node["status"] = "failed"
+        node["error"] = f"unknown agent {agent_id}"
+        return {"run_id": run_id, "agent_id": agent_id, "node_id": node_id,
+                "status": "failed", "error": node["error"], "attempt": 0}
+
+    await _emit_safe(deps, task_id, run_id, "agent_started",
+                     {"agent": agent_id, "name": defn.name, "domain": defn.domain, "node": node_id})
     try:
         mem_snips = await deps.memory.recall(task.get("project_id", ""), task.get("goal", ""), limit=5)
     except Exception:
         mem_snips = []
+
     ctx = AgentContext(goal=task["goal"], project_id=task.get("project_id", ""),
-                       task_id=task_id, node_id=node_id, memory_snippets=mem_snips)
+                       task_id=task_id, node_id=node_id, memory_snippets=mem_snips,
+                       upstream=task.get("upstream", {}))
+
+    async def emit_phase(phase: str, summary: str) -> None:
+        # Safe status only. The model's internal reasoning is never streamed.
+        await _emit_safe(deps, task_id, run_id, "thinking",
+                         {"agent": agent_id, "phase": phase, "status": summary})
+
     last_err: Exception | None = None
     for attempt in range(1, int(node.get("max_retries", 3)) + 1):
         node["attempts"] = attempt
         node["status"] = "running"
         t0 = time.time()
         try:
-            await _emit_safe(deps, task_id, run_id, "thinking", {"agent": agent_id, "phase": "UNDERSTAND"})
-            agent = GenericAgent(REGISTRY[agent_id])
-            await _emit_safe(deps, task_id, run_id, "thinking", {"agent": agent_id, "phase": "ACT"})
-            res = await asyncio.wait_for(agent.run(ctx, deps), timeout=float(node.get("timeout_s", 600)))
+            agent = GenericAgent(defn)
+            res = await asyncio.wait_for(agent.run(ctx, deps, node=node, emit_phase=emit_phase),
+                                         timeout=float(node.get("timeout_s", 600)))
             latency = int((time.time() - t0) * 1000)
             node["result"] = res.structured_output
-            node["status"] = "awaiting_approval" if node.get("needs_approval") and res.status == "completed" else res.status
+            node["status"] = ("awaiting_approval"
+                              if node.get("needs_approval") and res.status == "completed"
+                              else res.status)
             await _emit_safe(deps, task_id, run_id, "agent_completed",
-                             {"agent": agent_id, "node": node_id, "latency_ms": latency, "tokens": res.usage_tokens})
-            return {"run_id": run_id, "agent_id": agent_id, "node_id": node_id, "status": node["status"],
-                    "output": res.structured_output, "summary": res.summary,
-                    "tokens": res.usage_tokens, "cost": res.usage_usd, "latency_ms": latency, "attempt": attempt}
+                             {"agent": agent_id, "node": node_id, "latency_ms": latency,
+                              "tokens": res.usage_tokens,
+                              "think_depth": res.structured_output.get("think_depth"),
+                              "self_review": res.structured_output.get("self_review", {})})
+            return {"run_id": run_id, "agent_id": agent_id, "node_id": node_id,
+                    "status": node["status"], "output": res.structured_output,
+                    "summary": res.summary, "tokens": res.usage_tokens, "cost": res.usage_usd,
+                    "model": res.structured_output.get("model", ""),
+                    "latency_ms": latency, "attempt": attempt}
+        except asyncio.TimeoutError as e:
+            last_err = e
+            node["error"] = f"node timeout after {node.get('timeout_s', 600)}s"
+            await _emit_safe(deps, task_id, run_id, "retrying",
+                             {"agent": agent_id, "attempt": attempt, "error": "timeout"})
         except Exception as e:
             last_err = e
-            node["error"] = str(e)[:500]
+            node["error"] = redact(str(e))[:500]
             await _emit_safe(deps, task_id, run_id, "retrying",
-                             {"agent": agent_id, "attempt": attempt, "error": str(e)[:200]})
-            await asyncio.sleep(min(2 ** attempt, 10))
+                             {"agent": agent_id, "attempt": attempt, "error": redact(str(e))[:200]})
+        await asyncio.sleep(min(2 ** attempt, 10) * (0.7 + random.random() * 0.6))
     node["status"] = "failed"
     return {"run_id": run_id, "agent_id": agent_id, "node_id": node_id, "status": "failed",
-            "error": str(last_err)[:500], "attempt": node.get("attempts", 1)}
+            "error": redact(str(last_err))[:500], "attempt": node.get("attempts", 1)}
+
+
+def collect_upstream(dag: dict, node: dict, max_chars: int = 6000) -> dict:
+    """Structured JSON handoff between agents — not a blob of concatenated text."""
+    out: dict = {}
+    by_id = {n["node_id"]: n for n in dag.get("nodes", [])}
+    budget = max_chars
+    for dep in node.get("depends_on", []):
+        up = by_id.get(dep)
+        if not up or not up.get("result"):
+            continue
+        r = up["result"]
+        entry = {
+            "agent": r.get("agent"), "domain": r.get("domain"),
+            "deliverable": (r.get("deliverable") or "")[:max(400, budget // 2)],
+            "acceptance_criteria": (r.get("understanding") or {}).get("acceptance_criteria", [])[:6],
+            "open_questions": (r.get("understanding") or {}).get("unknowns", [])[:4],
+        }
+        blob = json.dumps(entry)
+        if len(blob) > budget:
+            entry["deliverable"] = entry["deliverable"][:max(200, budget // 3)]
+        out[dep] = entry
+        budget -= min(len(blob), budget)
+        if budget <= 200:
+            break
+    return out
 
 # =====================================================================================
 # 9. OMNIROUTE — model/provider routing gateway client (Maximus picks capability class)
@@ -1014,20 +2266,18 @@ class OmniRouteClient:
         self._failures[key] = 0
 
     async def discover_models(self) -> list[dict]:
-        async with httpx.AsyncClient(timeout=self.timeout) as c:
-            r = await c.get(f"{self.base}/models", headers=self._headers())
-            r.raise_for_status()
-            data = r.json()
+        r = await http().get(f"{self.base}/models", headers=self._headers(), timeout=self.timeout)
+        r.raise_for_status()
+        data = r.json()
         if isinstance(data, dict) and "data" in data:
             return data["data"]
         return data if isinstance(data, list) else []
 
     async def health(self) -> dict:
         try:
-            async with httpx.AsyncClient(timeout=10) as c:
-                r = await c.get(f"{self.base}/health", headers=self._headers())
-                if r.status_code == 200:
-                    return r.json()
+            r = await http().get(f"{self.base}/health", headers=self._headers(), timeout=10)
+            if r.status_code == 200:
+                return r.json()
         except Exception:
             pass
         try:
@@ -1040,25 +2290,127 @@ class OmniRouteClient:
                        model_hint: str | None = None, provider_key: str | None = None,
                        temperature: float = 0.2, max_tokens: int = 2000,
                        timeout_s: int | None = None,
-                       fallback_capabilities: list[str] | None = None) -> dict:
-        chain = [capability] + (fallback_capabilities or ["general"])
+                       fallback_capabilities: list[str] | None = None,
+                       provider: str = "", cache_key_extra: str = "") -> dict:
+        """One gated, cached, retried model call.
+
+        Rate limits are respected before the request leaves, not discovered via 429s.
+        """
+        chain = [capability] + (fallback_capabilities or CAPABILITY_MAP.get(capability, ["general"])[1:])
+        seen: set[str] = set()
+        chain = [c for c in chain if not (c in seen or seen.add(c))]
+
+        cached = RESPONSE_CACHE.get(messages, capability, max_tokens, cache_key_extra)
+        if cached is not None:
+            return cached
+
+        gate = gate_for(provider or _env("DEFAULT_PROVIDER", "_default"))
+        est = estimate_tokens(messages, max_tokens)
         last: Exception | None = None
+
         for cap in chain:
             if self._cb_open(cap):
                 continue
-            try:
-                async with httpx.AsyncClient(timeout=timeout_s or self.timeout) as c:
-                    r = await c.post(f"{self.base}/v1/chat/completions", headers=self._headers(provider_key),
-                                     json={"messages": messages, "capability": cap, "model": model_hint,
-                                           "temperature": temperature, "max_tokens": max_tokens})
+            for attempt in range(1, int(_env("MODEL_MAX_RETRIES", "3")) + 1):
+                try:
+                    await gate.acquire(est)
+                    async with gate.sem:
+                        t0 = time.monotonic()
+                        r = await http().post(
+                            f"{self.base}/v1/chat/completions",
+                            headers=self._headers(provider_key),
+                            json={"messages": messages, "capability": cap, "model": model_hint,
+                                  "temperature": temperature, "max_tokens": max_tokens},
+                            timeout=timeout_s or self.timeout)
+                    if r.status_code == 429:
+                        delay = gate.on_rate_limited(_retry_after(r))
+                        await asyncio.sleep(delay)
+                        continue
+                    if r.status_code >= 500:
+                        gate.on_error()
+                        raise OmniRouteError(f"gateway {r.status_code}")
                     r.raise_for_status()
+                    data = r.json()
+                    actual = int((data.get("usage") or {}).get("total_tokens") or est)
+                    await gate.settle(est, actual)
+                    gate.on_success()
                     self._cb_ok(cap)
-                    return r.json()
-            except Exception as e:
-                last = e
-                self._cb_fail(cap)
-                await asyncio.sleep(0.2)
-        raise OmniRouteError(f"all OmniRoute capabilities failed: {last}")
+                    data["_latency_ms"] = int((time.monotonic() - t0) * 1000)
+                    data["_cost_usd"] = data.get("_cost_usd", 0.0)
+                    RESPONSE_CACHE.put(messages, capability, max_tokens, cache_key_extra, data)
+                    return data
+                except AppError:
+                    raise                                     # quota/limit errors are terminal
+                except Exception as e:
+                    last = e
+                    gate.on_error()
+                    await gate.settle(est, 0)
+                    backoff = min(8.0, 0.25 * (2 ** attempt)) * (0.7 + random.random() * 0.6)
+                    await asyncio.sleep(backoff)              # jitter: don't synchronise retries
+            self._cb_fail(cap)
+        raise OmniRouteError(f"all capabilities failed: {redact(str(last))[:200]}")
+
+
+def _retry_after(r) -> float | None:
+    for h in ("retry-after", "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"):
+        v = r.headers.get(h)
+        if not v:
+            continue
+        try:
+            return max(0.0, float(re.sub(r"[^0-9.]", "", v) or 0))
+        except Exception:
+            continue
+    return None
+
+
+class ResponseCache:
+    """Exact-prompt cache. Identical sub-prompts recur constantly across a 480-agent
+    DAG (same goal, same understand/plan scaffolding), and a cache hit is free."""
+
+    def __init__(self, max_items: int = 2048, ttl_s: float = 900.0):
+        self.max_items, self.ttl_s = max_items, ttl_s
+        self._d: OrderedDict[str, tuple[float, dict]] = OrderedDict()
+        self.hits = self.misses = 0
+
+    @staticmethod
+    def _key(messages, capability, max_tokens, extra) -> str:
+        blob = json.dumps([messages, capability, max_tokens, extra], sort_keys=True, default=str)
+        return hashlib.sha256(blob.encode()).hexdigest()
+
+    def get(self, messages, capability, max_tokens, extra) -> dict | None:
+        if not CACHE_ENABLED:
+            return None
+        k = self._key(messages, capability, max_tokens, extra)
+        hit = self._d.get(k)
+        if hit and time.time() - hit[0] < self.ttl_s:
+            self._d.move_to_end(k)
+            self.hits += 1
+            out = dict(hit[1])
+            out["_cached"] = True
+            return out
+        if hit:
+            self._d.pop(k, None)
+        self.misses += 1
+        return None
+
+    def put(self, messages, capability, max_tokens, extra, value: dict) -> None:
+        if not CACHE_ENABLED:
+            return
+        k = self._key(messages, capability, max_tokens, extra)
+        self._d[k] = (time.time(), value)
+        self._d.move_to_end(k)
+        while len(self._d) > self.max_items:
+            self._d.popitem(last=False)
+
+    def stats(self) -> dict:
+        total = self.hits + self.misses
+        return {"hits": self.hits, "misses": self.misses, "size": len(self._d),
+                "hit_rate": round(self.hits / total, 3) if total else 0.0}
+
+
+CACHE_ENABLED = _env("RESPONSE_CACHE", "true").lower() in ("1", "true", "yes")
+RESPONSE_CACHE = ResponseCache(int(_env("RESPONSE_CACHE_ITEMS", "2048")),
+                               float(_env("RESPONSE_CACHE_TTL_S", "900")))
 
 
 CAPABILITY_MAP = {
@@ -1080,6 +2432,229 @@ DEFAULT_PROVIDERS = [
     ("groq", "Groq", "https://api.groq.com"),
     ("openrouter", "OpenRouter", "https://openrouter.ai/api"),
 ]
+
+
+# =====================================================================================
+# 7b. Shared HTTP + direct provider model discovery (BYOK -> catalogue, automatically)
+# =====================================================================================
+_HTTP: httpx.AsyncClient | None = None
+
+
+def http() -> httpx.AsyncClient:
+    """One pooled client for the whole process.
+
+    Opening a fresh AsyncClient per request costs a DNS lookup plus a TLS handshake
+    every single time — typically 80-250ms of pure latency on each model call.
+    """
+    global _HTTP
+    if _HTTP is None or _HTTP.is_closed:
+        _HTTP = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5.0, read=float(S.OMNIROUTE_TIMEOUT_S), write=10.0, pool=5.0),
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=40,
+                                keepalive_expiry=60.0),
+            follow_redirects=True,
+            headers={"User-Agent": f"{S.APP_NAME}/1.0"},
+        )
+    return _HTTP
+
+
+async def close_http() -> None:
+    global _HTTP
+    if _HTTP is not None and not _HTTP.is_closed:
+        await _HTTP.aclose()
+    _HTTP = None
+
+
+# provider -> (models path, auth style, response key)
+PROVIDER_DISCOVERY: dict[str, dict] = {
+    "openai":     dict(path="/v1/models", auth="bearer", key="data"),
+    "anthropic":  dict(path="/v1/models", auth="x-api-key", key="data"),
+    "gemini":     dict(path="/v1beta/models", auth="query", key="models"),
+    "groq":       dict(path="/openai/v1/models", auth="bearer", key="data"),
+    "mistral":    dict(path="/v1/models", auth="bearer", key="data"),
+    "deepseek":   dict(path="/models", auth="bearer", key="data"),
+    "nvidia":     dict(path="/v1/models", auth="bearer", key="data"),
+    "openrouter": dict(path="/v1/models", auth="bearer", key="data"),
+    "together":   dict(path="/v1/models", auth="bearer", key="data"),
+    "cohere":     dict(path="/v1/models", auth="bearer", key="models"),
+    "_default":   dict(path="/v1/models", auth="bearer", key="data"),
+}
+
+# substring -> capability tag. Ordered: first match wins for the primary tag.
+CAPABILITY_HINTS: tuple[tuple[str, str], ...] = (
+    ("embed", "embedding"), ("rerank", "rerank"), ("whisper", "audio"), ("tts", "audio"),
+    ("dall-e", "image"), ("imagen", "image"), ("flux", "image"), ("stable-diffusion", "image"),
+    ("coder", "code"), ("code", "code"), ("devstral", "code"), ("codestral", "code"),
+    ("vision", "vision"), ("-vl", "vision"), ("pixtral", "vision"), ("llava", "vision"),
+    ("reasoner", "reasoning"), ("thinking", "reasoning"), ("-r1", "reasoning"),
+    ("o1", "reasoning"), ("o3", "reasoning"), ("o4", "reasoning"), ("opus", "reasoning"),
+    ("sonnet", "reasoning"), ("gpt-4", "reasoning"), ("gpt-5", "reasoning"),
+    ("pro", "reasoning"), ("large", "reasoning"), ("70b", "reasoning"), ("405b", "reasoning"),
+    ("mini", "cheap"), ("flash", "cheap"), ("haiku", "cheap"), ("small", "cheap"),
+    ("8b", "cheap"), ("7b", "cheap"), ("nano", "cheap"), ("lite", "cheap"),
+)
+
+
+def infer_capabilities(model_id: str, context_window: int = 0) -> list[str]:
+    mid = (model_id or "").lower()
+    tags: list[str] = []
+    for needle, tag in CAPABILITY_HINTS:
+        if needle in mid and tag not in tags:
+            tags.append(tag)
+    if not tags:
+        tags = ["general"]
+    if tags[0] in ("embedding", "rerank", "audio", "image"):
+        return tags                       # not a chat model, no general tag
+    if "general" not in tags:
+        tags.append("general")
+    if context_window >= 200000 and "long-context" not in tags:
+        tags.append("long-context")
+    return tags
+
+
+def _tier_for(tags: list[str], cost_in: float) -> str:
+    if "cheap" in tags or (cost_in and cost_in < 0.0005):
+        return "cheap"
+    if "reasoning" in tags or (cost_in and cost_in >= 0.003):
+        return "premium"
+    return "standard"
+
+
+def _normalise_models(provider: str, payload: Any) -> list[dict]:
+    """Every provider returns a slightly different shape. Flatten them all."""
+    spec = PROVIDER_DISCOVERY.get(provider, PROVIDER_DISCOVERY["_default"])
+    if isinstance(payload, dict):
+        rows = payload.get(spec["key"]) or payload.get("data") or payload.get("models") or []
+    elif isinstance(payload, list):
+        rows = payload
+    else:
+        rows = []
+    out: list[dict] = []
+    for r in rows:
+        if isinstance(r, str):
+            r = {"id": r}
+        if not isinstance(r, dict):
+            continue
+        mid = r.get("id") or r.get("name") or r.get("model") or ""
+        if not mid:
+            continue
+        if provider == "gemini" and mid.startswith("models/"):
+            mid = mid.split("/", 1)[1]
+        ctx = int(r.get("context_length") or r.get("context_window")
+                  or r.get("inputTokenLimit") or r.get("max_input_tokens") or 0)
+        pricing = r.get("pricing") or {}
+        try:
+            cin = float(pricing.get("prompt", 0) or 0) * 1000
+            cout = float(pricing.get("completion", 0) or 0) * 1000
+        except (TypeError, ValueError):
+            cin = cout = 0.0
+        # Gemini exposes which methods a model supports; skip non-chat ones
+        methods = r.get("supportedGenerationMethods")
+        if methods and not any("generateContent" in m or "chat" in m.lower() for m in methods):
+            continue
+        tags = infer_capabilities(mid, ctx)
+        out.append({
+            "model_id": mid, "provider": provider, "capability_tags": tags,
+            "context_window": ctx or 128000, "cost_in_per_1k": round(cin, 6),
+            "cost_out_per_1k": round(cout, 6), "tier": _tier_for(tags, cin),
+            "display_name": r.get("display_name") or r.get("name") or mid,
+        })
+    # stable, de-duplicated
+    seen, uniq = set(), []
+    for m in sorted(out, key=lambda x: x["model_id"]):
+        if m["model_id"] not in seen:
+            seen.add(m["model_id"])
+            uniq.append(m)
+    return uniq
+
+
+async def discover_models_for_key(provider: str, api_key: str, base_url: str = "",
+                                  timeout_s: float = 15.0) -> dict:
+    """Call the provider's own model-listing endpoint with the user's key.
+
+    Returns {ok, models, error}. The key is used in headers only — never logged,
+    never echoed back, never written to the event stream.
+    """
+    provider = (provider or "").lower()
+    spec = PROVIDER_DISCOVERY.get(provider, PROVIDER_DISCOVERY["_default"])
+    base = (base_url or dict((p[0], p[2]) for p in DEFAULT_PROVIDERS).get(provider, "")).rstrip("/")
+    if not base:
+        return {"ok": False, "models": [], "error": f"no base url known for provider '{provider}'"}
+
+    url = base + spec["path"]
+    headers: dict[str, str] = {"Accept": "application/json"}
+    params: dict[str, str] = {}
+    if spec["auth"] == "bearer":
+        headers["Authorization"] = f"Bearer {api_key}"
+    elif spec["auth"] == "x-api-key":
+        headers["x-api-key"] = api_key
+        headers["anthropic-version"] = _env("ANTHROPIC_VERSION", "2023-06-01")
+    elif spec["auth"] == "query":
+        params["key"] = api_key
+
+    try:
+        assert_url_allowed(url)                       # SSRF guard applies to BYOK too
+        r = await http().get(url, headers=headers, params=params, timeout=timeout_s)
+    except Exception as e:
+        return {"ok": False, "models": [], "error": redact(str(e))[:200]}
+
+    if r.status_code in (401, 403):
+        return {"ok": False, "models": [], "error": "provider rejected the key (invalid or insufficient scope)"}
+    if r.status_code == 429:
+        return {"ok": False, "models": [], "error": "provider rate-limited the discovery call; try again shortly"}
+    if r.status_code >= 400:
+        return {"ok": False, "models": [], "error": f"provider returned HTTP {r.status_code}"}
+    try:
+        models = _normalise_models(provider, r.json())
+    except Exception as e:
+        return {"ok": False, "models": [], "error": f"unparseable model list: {redact(str(e))[:120]}"}
+    return {"ok": True, "models": models, "error": ""}
+
+
+async def persist_models(db: AsyncSession, provider_slug: str, models: list[dict]) -> int:
+    """Upsert discovered models so routing can see them immediately."""
+    prov = (await db.execute(select(Provider).where(Provider.slug == provider_slug))).scalars().first()
+    if not prov:
+        return 0
+    existing = {m.model_id: m for m in
+                (await db.execute(select(Model).where(Model.provider_id == prov.id))).scalars().all()}
+    n = 0
+    for m in models:
+        row = existing.get(m["model_id"])
+        if row:
+            row.capability_tags = m["capability_tags"]
+            row.context_window = m["context_window"]
+            row.cost_in_per_1k = m["cost_in_per_1k"]
+            row.cost_out_per_1k = m["cost_out_per_1k"]
+            row.tier = m["tier"]
+            row.enabled = True
+        else:
+            db.add(Model(provider_id=prov.id, model_id=m["model_id"],
+                         capability_tags=m["capability_tags"], context_window=m["context_window"],
+                         cost_in_per_1k=m["cost_in_per_1k"], cost_out_per_1k=m["cost_out_per_1k"],
+                         tier=m["tier"], enabled=True))
+        n += 1
+    prov.status = "healthy"
+    await db.commit()
+    return n
+
+
+def pick_model(models: list[dict], capability: str, budget_usd: float = 5.0) -> dict | None:
+    """Choose the cheapest model that actually satisfies the requested capability."""
+    if not models:
+        return None
+    wanted = CAPABILITY_MAP.get(capability, [capability, "general"])
+    for cap in wanted:
+        pool = [m for m in models if cap in (m.get("capability_tags") or [])]
+        if not pool:
+            continue
+        # cheap-first routing; escalation is an explicit decision, not a default
+        pool.sort(key=lambda m: (m.get("cost_in_per_1k", 0.0), -m.get("context_window", 0)))
+        if budget_usd < 1.0:
+            return pool[0]
+        premium = [m for m in pool if m.get("tier") == "premium"]
+        return (premium or pool)[0]
+    return models[0]
 
 
 async def seed_providers(db: AsyncSession) -> None:
@@ -1229,9 +2804,8 @@ class FetchTool(Tool):
     async def run(self, args: dict, ctx: dict) -> ToolResult:
         try:
             url = assert_url_allowed(args.get("url", ""))
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
-                r = await c.get(url)
-                return ToolResult(True, sanitize_tool_output(r.text[:15000]))
+            r = await http().get(url, headers=UA, timeout=20)
+            return ToolResult(True, sanitize_tool_output(r.text[:15000]))
         except Exception as e:
             return ToolResult(False, error=str(e)[:500])
 
@@ -1262,10 +2836,234 @@ class TerminalTool(Tool):
         return ToolResult(False, error="use sandbox exec endpoint (approval required)")
 
 
+# =====================================================================================
+# 9b. Free tools — everything below works with no API key and no paid account
+# =====================================================================================
+FREE_ENDPOINTS = {
+    "wikipedia": "https://{lang}.wikipedia.org/w/api.php",
+    "wikidata": "https://www.wikidata.org/w/api.php",
+    "arxiv": "https://export.arxiv.org/api/query",
+    "open_meteo": "https://api.open-meteo.com/v1/forecast",
+    "geocode": "https://geocoding-api.open-meteo.com/v1/search",
+    "nominatim": "https://nominatim.openstreetmap.org/search",
+    "duckduckgo": "https://html.duckduckgo.com/html/",
+    "ddg_answer": "https://api.duckduckgo.com/",
+    "searxng": _env("SEARXNG_URL", "").rstrip("/"),
+    "hn": "https://hn.algolia.com/api/v1/search",
+    "crossref": "https://api.crossref.org/works",
+    "openlibrary": "https://openlibrary.org/search.json",
+}
+
+UA = {"User-Agent": f"{S.APP_NAME}/1.0 (self-hosted; open-source agent platform)"}
+
+
+def _strip_html(html: str, limit: int = 4000) -> str:
+    html = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", html)
+    html = re.sub(r"(?s)<[^>]+>", " ", html)
+    html = (html.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+                .replace("&quot;", '"').replace("&#39;", "'").replace("&nbsp;", " "))
+    return re.sub(r"\s+", " ", html).strip()[:limit]
+
+
+class WebSearchTool(Tool):
+    """Free web search. Uses a self-hosted SearXNG when configured, otherwise
+    DuckDuckGo's public HTML endpoint. No API key, no paid tier, no tracking."""
+
+    def __init__(self):
+        super().__init__("web_search", "Free web search (SearXNG or DuckDuckGo)", ["net:fetch"],
+                         {"query": "str", "max_results": "int"})
+
+    async def run(self, args: dict, ctx: dict) -> ToolResult:
+        q = str(args.get("query", "")).strip()
+        if not q:
+            return ToolResult(False, error="query is required")
+        k = int(args.get("max_results", 6))
+        try:
+            if FREE_ENDPOINTS["searxng"]:
+                r = await http().get(f"{FREE_ENDPOINTS['searxng']}/search",
+                                     params={"q": q, "format": "json"}, headers=UA, timeout=20)
+                r.raise_for_status()
+                rows = r.json().get("results", [])[:k]
+                out = [{"title": x.get("title"), "url": x.get("url"),
+                        "snippet": (x.get("content") or "")[:300]} for x in rows]
+                return ToolResult(True, {"engine": "searxng", "results": out})
+
+            r = await http().post(FREE_ENDPOINTS["duckduckgo"], data={"q": q},
+                                  headers=UA, timeout=20)
+            r.raise_for_status()
+            out = []
+            for m in re.finditer(
+                    r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>'
+                    r'(?:.*?class="result__snippet"[^>]*>(.*?)</a>)?', r.text, re.S):
+                url, title, snip = m.group(1), _strip_html(m.group(2), 200), _strip_html(m.group(3) or "", 300)
+                if url.startswith("//duckduckgo.com/l/?uddg="):
+                    url = urllib.parse.unquote(url.split("uddg=")[1].split("&")[0])
+                out.append({"title": title, "url": url, "snippet": snip})
+                if len(out) >= k:
+                    break
+            if not out:
+                a = await http().get(FREE_ENDPOINTS["ddg_answer"],
+                                     params={"q": q, "format": "json", "no_html": 1},
+                                     headers=UA, timeout=15)
+                j = a.json()
+                if j.get("AbstractText"):
+                    out = [{"title": j.get("Heading", q), "url": j.get("AbstractURL", ""),
+                            "snippet": j["AbstractText"][:400]}]
+            return ToolResult(True, {"engine": "duckduckgo", "results": out})
+        except Exception as e:
+            return ToolResult(False, error=redact(str(e))[:300])
+
+
+class WikipediaTool(Tool):
+    def __init__(self):
+        super().__init__("wikipedia", "Wikipedia search and article extracts (free)", ["net:fetch"],
+                         {"query": "str", "lang": "str"})
+
+    async def run(self, args: dict, ctx: dict) -> ToolResult:
+        q = str(args.get("query", "")).strip()
+        lang = re.sub(r"[^a-z]", "", str(args.get("lang", "en")).lower()) or "en"
+        if not q:
+            return ToolResult(False, error="query is required")
+        base = FREE_ENDPOINTS["wikipedia"].format(lang=lang)
+        try:
+            r = await http().get(base, headers=UA, timeout=20, params={
+                "action": "query", "format": "json", "prop": "extracts", "generator": "search",
+                "gsrsearch": q, "gsrlimit": 3, "exintro": 1, "explaintext": 1})
+            r.raise_for_status()
+            pages = (r.json().get("query") or {}).get("pages", {})
+            out = [{"title": p.get("title"),
+                    "extract": (p.get("extract") or "")[:2000],
+                    "url": f"https://{lang}.wikipedia.org/?curid={p.get('pageid')}"}
+                   for p in pages.values()]
+            return ToolResult(True, {"results": out})
+        except Exception as e:
+            return ToolResult(False, error=redact(str(e))[:300])
+
+
+class ArxivTool(Tool):
+    def __init__(self):
+        super().__init__("arxiv", "arXiv paper search (free)", ["net:fetch"],
+                         {"query": "str", "max_results": "int"})
+
+    async def run(self, args: dict, ctx: dict) -> ToolResult:
+        q = str(args.get("query", "")).strip()
+        if not q:
+            return ToolResult(False, error="query is required")
+        try:
+            r = await http().get(FREE_ENDPOINTS["arxiv"], headers=UA, timeout=25, params={
+                "search_query": f"all:{q}", "start": 0,
+                "max_results": min(int(args.get("max_results", 5)), 20)})
+            r.raise_for_status()
+            out = []
+            for entry in re.findall(r"(?s)<entry>(.*?)</entry>", r.text):
+                def pick(tag):
+                    m = re.search(rf"(?s)<{tag}>(.*?)</{tag}>", entry)
+                    return _strip_html(m.group(1), 1200) if m else ""
+                out.append({"title": pick("title"), "summary": pick("summary")[:800],
+                            "published": pick("published"), "url": pick("id")})
+            return ToolResult(True, {"results": out})
+        except Exception as e:
+            return ToolResult(False, error=redact(str(e))[:300])
+
+
+class WeatherTool(Tool):
+    def __init__(self):
+        super().__init__("open_meteo", "Weather forecast via Open-Meteo (free, no key)",
+                         ["net:fetch"], {"location": "str"})
+
+    async def run(self, args: dict, ctx: dict) -> ToolResult:
+        loc = str(args.get("location", "")).strip()
+        lat, lon = args.get("latitude"), args.get("longitude")
+        try:
+            if lat is None or lon is None:
+                if not loc:
+                    return ToolResult(False, error="location or latitude/longitude required")
+                g = await http().get(FREE_ENDPOINTS["geocode"], headers=UA, timeout=15,
+                                     params={"name": loc, "count": 1})
+                g.raise_for_status()
+                res = (g.json().get("results") or [])
+                if not res:
+                    return ToolResult(False, error=f"could not geocode '{loc}'")
+                lat, lon, loc = res[0]["latitude"], res[0]["longitude"], res[0]["name"]
+            r = await http().get(FREE_ENDPOINTS["open_meteo"], headers=UA, timeout=15, params={
+                "latitude": lat, "longitude": lon,
+                "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code",
+                "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum",
+                "forecast_days": 3, "timezone": "auto"})
+            r.raise_for_status()
+            j = r.json()
+            return ToolResult(True, {"location": loc, "latitude": lat, "longitude": lon,
+                                     "current": j.get("current"), "daily": j.get("daily")})
+        except Exception as e:
+            return ToolResult(False, error=redact(str(e))[:300])
+
+
+class GeocodeTool(Tool):
+    def __init__(self):
+        super().__init__("osm_geocode", "OpenStreetMap/Nominatim geocoding (free)", ["net:fetch"],
+                         {"query": "str"})
+
+    async def run(self, args: dict, ctx: dict) -> ToolResult:
+        q = str(args.get("query", "")).strip()
+        if not q:
+            return ToolResult(False, error="query is required")
+        try:
+            r = await http().get(FREE_ENDPOINTS["nominatim"], headers=UA, timeout=20,
+                                 params={"q": q, "format": "jsonv2", "limit": 5})
+            r.raise_for_status()
+            out = [{"name": x.get("display_name"), "lat": x.get("lat"), "lon": x.get("lon"),
+                    "type": x.get("type")} for x in r.json()]
+            return ToolResult(True, {"results": out})
+        except Exception as e:
+            return ToolResult(False, error=redact(str(e))[:300])
+
+
+class ScholarTool(Tool):
+    def __init__(self):
+        super().__init__("crossref", "Academic metadata via Crossref (free)", ["net:fetch"],
+                         {"query": "str"})
+
+    async def run(self, args: dict, ctx: dict) -> ToolResult:
+        q = str(args.get("query", "")).strip()
+        try:
+            r = await http().get(FREE_ENDPOINTS["crossref"], headers=UA, timeout=20,
+                                 params={"query": q, "rows": 5})
+            r.raise_for_status()
+            items = (r.json().get("message") or {}).get("items", [])
+            out = [{"title": (i.get("title") or [""])[0], "year":
+                    ((i.get("issued") or {}).get("date-parts") or [[None]])[0][0],
+                    "doi": i.get("DOI"), "type": i.get("type"),
+                    "container": (i.get("container-title") or [""])[0]} for i in items]
+            return ToolResult(True, {"results": out})
+        except Exception as e:
+            return ToolResult(False, error=redact(str(e))[:300])
+
+
+class HackerNewsTool(Tool):
+    def __init__(self):
+        super().__init__("hackernews", "Hacker News search via Algolia (free)", ["net:fetch"],
+                         {"query": "str"})
+
+    async def run(self, args: dict, ctx: dict) -> ToolResult:
+        try:
+            r = await http().get(FREE_ENDPOINTS["hn"], headers=UA, timeout=20,
+                                 params={"query": str(args.get("query", "")), "hitsPerPage": 8})
+            r.raise_for_status()
+            out = [{"title": h.get("title"), "url": h.get("url"), "points": h.get("points"),
+                    "comments": h.get("num_comments"),
+                    "hn_url": f"https://news.ycombinator.com/item?id={h.get('objectID')}"}
+                   for h in r.json().get("hits", []) if h.get("title")]
+            return ToolResult(True, {"results": out})
+        except Exception as e:
+            return ToolResult(False, error=redact(str(e))[:300])
+
+
 class ToolManager:
     def __init__(self):
         self._tools: dict[str, Tool] = {}
-        for t in (FilesystemTool(), FetchTool(), SQLiteTool(), TerminalTool()):
+        for t in (FilesystemTool(), FetchTool(), SQLiteTool(), TerminalTool(),
+                  WebSearchTool(), WikipediaTool(), ArxivTool(), WeatherTool(),
+                  GeocodeTool(), ScholarTool(), HackerNewsTool()):
             self._tools[t.name] = t
 
     def register(self, tool: Tool) -> None:
@@ -1333,129 +3131,308 @@ class ExecResult(dict):
     pass
 
 
-class SandboxAdapter:
-    name = "base"
+# =====================================================================================
+# 10. Local runtime — the user's own machine is the isolation boundary
+# =====================================================================================
+# No E2B. No Docker. No cloud. Code runs here, in a jailed working directory, with
+# the network cut off and hard resource ceilings. Isolation is layered, and the layers
+# that are actually active are reported honestly via /v1/sandboxes/capabilities.
+import resource
+import signal
 
-    async def create(self, task_id: str) -> str:
-        raise NotImplementedError
+NET_KILL_ENV = {
+    "http_proxy": "http://127.0.0.1:9", "https_proxy": "http://127.0.0.1:9",
+    "HTTP_PROXY": "http://127.0.0.1:9", "HTTPS_PROXY": "http://127.0.0.1:9",
+    "ALL_PROXY": "socks5://127.0.0.1:9", "all_proxy": "socks5://127.0.0.1:9",
+    "no_proxy": "", "NO_PROXY": "",
+    # stop package managers from phoning home even if a net namespace is unavailable
+    "PIP_NO_INDEX": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+    "NPM_CONFIG_OFFLINE": "true", "NPM_CONFIG_REGISTRY": "http://127.0.0.1:9",
+    "GIT_TERMINAL_PROMPT": "0", "MAXIMUS_SANDBOX": "1",
+}
 
-    async def exec(self, box_id: str, language: str, code: str, command: str, approve: bool) -> ExecResult:
-        raise NotImplementedError
 
-    async def destroy(self, box_id: str) -> None:
-        raise NotImplementedError
+def _probe(script: str, timeout: float = 8.0) -> bool:
+    try:
+        p = subprocess.run([UNSHARE_BIN, "-rmn", "--fork", "--pid", "/bin/sh", "-c", script],
+                           capture_output=True, timeout=timeout)
+        return p.returncode == 0 and b"PROBE_OK" in p.stdout
+    except Exception:
+        return False
 
 
-class LocalSandbox(SandboxAdapter):
+def _detect_isolation() -> str:
+    """Pick the strongest isolation this machine can actually provide. No guessing."""
+    if sys.platform != "linux" or shutil.which("unshare") is None:
+        return "none"
+    probe_dir = Path(tempfile.mkdtemp(prefix="maximus-probe-"))
+    try:
+        for d in ("usr", "bin", "lib", "lib64", "etc", "proc", "tmp", "dev", "work"):
+            (probe_dir / d).mkdir(parents=True, exist_ok=True)
+        script = _jail_script(probe_dir, probe_dir / "work", ["/bin/sh", "-c", "echo PROBE_OK"])
+        if _probe(script):
+            return "chroot_ns"           # filesystem + network + pid isolation
+    except Exception:
+        pass
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
+    try:
+        p = subprocess.run([UNSHARE_BIN, "-rn", "true"], capture_output=True, timeout=5)
+        if p.returncode == 0:
+            return "netns"               # network only; host filesystem still visible
+    except Exception:
+        pass
+    return "none"
+
+
+def _bin(name: str, *fallbacks: str) -> str:
+    p = shutil.which(name)
+    if p:
+        return p
+    for f in fallbacks:
+        if Path(f).exists():
+            return f
+    return name
+
+
+# absolute paths: the sandbox runs with a scrubbed PATH that excludes sbin
+CHROOT_BIN = _bin("chroot", "/usr/sbin/chroot", "/sbin/chroot")
+MOUNT_BIN = _bin("mount", "/usr/bin/mount", "/bin/mount")
+UNSHARE_BIN = _bin("unshare", "/usr/bin/unshare", "/bin/unshare")
+
+RO_BINDS = ("usr", "bin", "sbin", "lib", "lib64", "lib32")
+DEV_NODES = ("null", "zero", "full", "urandom", "random", "tty")
+
+
+def _jail_script(jail: Path, work: Path, argv: list[str]) -> str:
+    """Build the mount + chroot script. Read-only system, writable /work only."""
+    j = shlex.quote(str(jail))
+    w = shlex.quote(str(work))
+    inner = " ".join(shlex.quote(a) for a in argv)
+    m = shlex.quote(MOUNT_BIN)
+    lines = ["set -e"]
+    for d in RO_BINDS:
+        lines.append(f'if [ -d /{d} ]; then mkdir -p {j}/{d}; {m} --bind /{d} {j}/{d}; '
+                     f'{m} -o remount,ro,bind {j}/{d}; fi')
+    lines.append(f'mkdir -p {j}/proc {j}/tmp {j}/dev {j}/etc {j}/work')
+    lines.append(f'{m} -t proc proc {j}/proc 2>/dev/null || true')
+    lines.append(f'{m} -t tmpfs -o size=64m,mode=1777 tmpfs {j}/tmp')
+    for f in DEV_NODES:
+        lines.append(f'if [ -e /dev/{f} ]; then touch {j}/dev/{f} 2>/dev/null || true; '
+                     f'{m} --bind /dev/{f} {j}/dev/{f} 2>/dev/null || true; fi')
+    lines.append(f'{m} --bind {w} {j}/work')
+    # a minimal passwd so tools that look up the current uid do not fail
+    lines.append(f'printf "sandbox:x:65534:65534:sandbox:/work:/bin/sh\n" > {j}/etc/passwd 2>/dev/null || true')
+    lines.append(f'exec {shlex.quote(CHROOT_BIN)} {j} /bin/sh -c "cd /work && exec {inner}"')
+    return "\n".join(lines)
+
+
+ISOLATION_MODE: str = _detect_isolation()
+STRICT_ISOLATION = _env("STRICT_ISOLATION", "true").lower() in ("1", "true", "yes")
+
+
+def isolation_report() -> dict:
+    mode = ISOLATION_MODE
+    layers = {
+        "workspace_jail": True,
+        "filesystem_jail": mode == "chroot_ns",
+        "network_namespace": mode in ("chroot_ns", "netns"),
+        "pid_namespace": mode == "chroot_ns",
+        "readonly_system": mode == "chroot_ns",
+        "proxy_blackhole": True,
+        "env_scrubbed": True,
+        "resource_limits": sys.platform != "win32",
+        "process_group_kill": sys.platform != "win32",
+        "explicit_approval_required": True,
+    }
+    notes = {
+        "chroot_ns": ("Full local jail: the process runs in its own mount, network and PID "
+                      "namespaces, chrooted to a read-only system with only its workspace "
+                      "writable. It cannot see host files and has no route off the machine."),
+        "netns": ("Network is namespace-isolated, but a filesystem jail could not be built, so "
+                  "host files remain readable. Install util-linux and enable unprivileged user "
+                  "namespaces for the full jail."),
+        "none": ("No kernel isolation available on this platform. Egress is blocked best-effort "
+                 "via proxy blackhole and a scrubbed environment, which determined code can "
+                 "bypass. Leave STRICT_ISOLATION=true to refuse execution instead."),
+    }
+    return {
+        "adapter": "local", "mode": mode, "layers": layers,
+        "network_egress": "blocked (kernel namespace)" if mode in ("chroot_ns", "netns")
+                          else "blocked (best-effort)",
+        "filesystem": "jailed to workspace" if mode == "chroot_ns" else "host filesystem visible",
+        "strict_mode": STRICT_ISOLATION,
+        "hard_guarantee": mode == "chroot_ns",
+        "remote_execution": "never — all execution is local to this machine",
+        "note": notes[mode],
+    }
+
+
+class ExecLimits:
+    cpu_seconds = int(_env("SANDBOX_CPU_SECONDS", "30"))
+    memory_mb = int(_env("SANDBOX_MEMORY_MB", "512"))
+    file_size_mb = int(_env("SANDBOX_FILE_SIZE_MB", "32"))
+    max_processes = int(_env("SANDBOX_MAX_PROCESSES", "64"))
+    max_open_files = int(_env("SANDBOX_MAX_OPEN_FILES", "256"))
+    wall_seconds = int(_env("SANDBOX_WALL_SECONDS", "60"))
+    max_output = int(_env("SANDBOX_MAX_OUTPUT", "20000"))
+
+
+def _apply_rlimits() -> None:  # runs in the child, after fork, before exec
+    try:
+        os.setsid()
+    except Exception:
+        pass
+    lim = ExecLimits
+    for what, soft in (
+        (resource.RLIMIT_CPU, lim.cpu_seconds),
+        (resource.RLIMIT_AS, lim.memory_mb * 1024 * 1024),
+        (resource.RLIMIT_FSIZE, lim.file_size_mb * 1024 * 1024),
+        (resource.RLIMIT_NPROC, lim.max_processes),
+        (resource.RLIMIT_NOFILE, lim.max_open_files),
+        (resource.RLIMIT_CORE, 0),
+    ):
+        try:
+            resource.setrlimit(what, (soft, soft))
+        except (ValueError, OSError):
+            pass
+
+
+def _clean_env(workdir: Path) -> dict[str, str]:
+    """Nothing from the host environment leaks in — especially not API keys."""
+    env = {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "HOME": str(workdir),
+        "TMPDIR": str(workdir / ".tmp"),
+        "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONNOUSERSITE": "1",
+    }
+    env.update(NET_KILL_ENV)
+    return env
+
+
+class LocalRuntime:
+    """The only execution backend. Runs on this machine, isolated, never remote."""
+
     name = "local"
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.root = Path(S.ALLOWED_SANDBOX_ROOT)
         self.root.mkdir(parents=True, exist_ok=True)
         self.boxes: dict[str, Path] = {}
 
+    def _workdir(self, box_id: str) -> Path:
+        p = self.boxes.get(box_id)
+        if p is None:
+            p = assert_path_inside(self.root, box_id)
+        p.mkdir(parents=True, exist_ok=True)
+        (p / ".tmp").mkdir(exist_ok=True)
+        return p
+
     async def create(self, task_id: str) -> str:
-        bid = f"{task_id}-{uuid.uuid4().hex[:8]}"
+        bid = f"{(task_id or 'adhoc')[:40]}-{uuid.uuid4().hex[:8]}"
         p = self.root / bid
         p.mkdir(parents=True, exist_ok=True)
+        (p / ".tmp").mkdir(exist_ok=True)
         self.boxes[bid] = p
         return bid
 
-    async def exec(self, box_id: str, language: str, code: str, command: str, approve: bool) -> ExecResult:
+    async def exec(self, box_id: str, language: str, code: str, command: str,
+                   approve: bool) -> ExecResult:
+        # Generated or downloaded code never runs on its own.
         if not approve:
-            return ExecResult({"ok": False, "error": "explicit approval required (approve_generated_code=true)"})
-        box = self.boxes.get(box_id)
-        if box is None:
-            box = assert_path_inside(self.root, box_id)
-            box.mkdir(parents=True, exist_ok=True)
+            return ExecResult({"ok": False, "error": "explicit approval required (approve_generated_code=true)",
+                               "isolation": isolation_report()["network_egress"]})
+        if STRICT_ISOLATION and ISOLATION_MODE != "chroot_ns":
+            return ExecResult({"ok": False,
+                               "error": "strict isolation is on but this machine cannot provide a full "
+                                        "local jail (needs unshare + unprivileged user namespaces). "
+                                        "Refusing to execute. Set STRICT_ISOLATION=false to accept the "
+                                        "weaker guarantee described in /v1/sandboxes/capabilities.",
+                               "isolation": isolation_report()})
+        try:
+            box = self._workdir(box_id)
+        except Exception as e:
+            return ExecResult({"ok": False, "error": f"invalid workspace: {redact(str(e))[:160]}"})
+
         if language == "shell":
-            assert_command_allowed(command)
-            proc = await asyncio.create_subprocess_shell(
-                command, cwd=str(box), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            try:
+                assert_command_allowed(command)
+            except Exception as e:
+                return ExecResult({"ok": False, "error": str(e)[:200]})
+            argv = ["/bin/sh", "-c", command]
         elif language == "python":
-            f = Path(box) / "main.py"
-            f.write_text(code, encoding="utf-8")
-            proc = await asyncio.create_subprocess_exec(
-                "python", str(f), cwd=str(box), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-        elif language == "javascript":
+            (box / "main.py").write_text(code, encoding="utf-8")
+            argv = ["/usr/bin/python3" if ISOLATION_MODE == "chroot_ns" else (sys.executable or "python3"),
+                    "-I", "-S", "main.py"]
+        elif language in ("javascript", "node"):
             if shutil.which("node") is None:
-                return ExecResult({"ok": False, "error": "node not installed"})
-            f = Path(box) / "main.js"
-            f.write_text(code, encoding="utf-8")
-            proc = await asyncio.create_subprocess_exec(
-                "node", str(f), cwd=str(box), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+                return ExecResult({"ok": False, "error": "node is not installed on this machine"})
+            (box / "main.js").write_text(code, encoding="utf-8")
+            argv = ["node", "main.js"]
         else:
             return ExecResult({"ok": False, "error": f"unsupported language {language}"})
+
+        if ISOLATION_MODE == "chroot_ns":
+            jail = box / ".jail"
+            jail.mkdir(parents=True, exist_ok=True)
+            argv = [UNSHARE_BIN, "-rmn", "--fork", "--pid", "/bin/sh", "-c",
+                    _jail_script(jail, box, argv)]
+        elif ISOLATION_MODE == "netns":
+            argv = [UNSHARE_BIN, "-rn"] + argv
+        t0 = time.monotonic()
         try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
-            return ExecResult({"ok": proc.returncode == 0, "exit": proc.returncode,
-                               "output": out.decode(errors="replace")[:20000]})
+            proc = await asyncio.create_subprocess_exec(
+                *argv, cwd=str(box), env=_clean_env(box),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                preexec_fn=_apply_rlimits if sys.platform != "win32" else None,
+            )
+        except Exception as e:
+            return ExecResult({"ok": False, "error": f"spawn failed: {redact(str(e))[:200]}"})
+
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=ExecLimits.wall_seconds)
         except asyncio.TimeoutError:
-            proc.kill()
-            return ExecResult({"ok": False, "error": "timeout (120s)"})
+            self._kill_tree(proc)
+            return ExecResult({"ok": False, "error": f"timeout after {ExecLimits.wall_seconds}s",
+                               "elapsed_ms": int((time.monotonic() - t0) * 1000)})
+        text = sanitize_tool_output(out.decode(errors="replace"), ExecLimits.max_output)
+        return ExecResult({
+            "ok": proc.returncode == 0, "exit": proc.returncode,
+            "output": text, "elapsed_ms": int((time.monotonic() - t0) * 1000),
+            "isolation_mode": ISOLATION_MODE,
+        })
+
+    @staticmethod
+    def _kill_tree(proc) -> None:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     async def destroy(self, box_id: str) -> None:
         p = self.boxes.pop(box_id, None) or (self.root / box_id)
-        if Path(str(p)).exists():
-            shutil.rmtree(str(p), ignore_errors=True)
-
-
-class MockSandbox(SandboxAdapter):
-    name = "mock"
-
-    async def create(self, task_id: str) -> str:
-        return f"mock-{task_id}"
-
-    async def exec(self, box_id: str, language: str, code: str, command: str, approve: bool) -> ExecResult:
-        return ExecResult({"ok": True, "exit": 0, "output": f"[mock:{language}] ok", "box": box_id})
-
-    async def destroy(self, box_id: str) -> None:
-        return None
-
-
-class DockerSandbox(SandboxAdapter):
-    name = "docker"
-
-    async def create(self, task_id: str) -> str:
         try:
-            import docker  # type: ignore
-        except ImportError:
-            raise RuntimeError("docker package not installed (pip install docker)")
-        return f"docker-{task_id}-{uuid.uuid4().hex[:6]}"
-
-    async def exec(self, box_id: str, language: str, code: str, command: str, approve: bool) -> ExecResult:
-        if not approve:
-            return ExecResult({"ok": False, "error": "explicit approval required"})
-        return ExecResult({"ok": False, "error": "docker exec not configured in single-file build (use local adapter)"})
-
-    async def destroy(self, box_id: str) -> None:
-        return None
+            target = assert_path_inside(self.root, str(p))
+        except Exception:
+            return
+        if target.exists():
+            shutil.rmtree(str(target), ignore_errors=True)
 
 
-class E2BSandbox(SandboxAdapter):
-    name = "e2b"
-
-    async def create(self, task_id: str) -> str:
-        if not S.E2B_API_KEY:
-            raise RuntimeError("E2B_API_KEY not set")
-        return f"e2b-{task_id}"
-
-    async def exec(self, box_id: str, language: str, code: str, command: str, approve: bool) -> ExecResult:
-        return ExecResult({"ok": False, "error": "E2B adapter stub — set E2B_API_KEY and implement SDK call"})
-
-    async def destroy(self, box_id: str) -> None:
-        return None
+_RUNTIME = LocalRuntime()
 
 
-def get_sandbox() -> SandboxAdapter:
-    kind = S.SANDBOX_ADAPTER.lower()
-    if kind == "mock":
-        return MockSandbox()
-    if kind == "docker":
-        return DockerSandbox()
-    if kind == "e2b":
-        return E2BSandbox()
-    return LocalSandbox()
+def get_sandbox() -> LocalRuntime:
+    """There is exactly one execution backend, and it is local."""
+    return _RUNTIME
+
 
 # =====================================================================================
 # 14. VERIFICATION — factual/code/test/security/quality/completion + critic repair loop
@@ -1594,7 +3571,8 @@ async def execute_task(task_id: str) -> None:
                 node["status"] = "failed"
                 node["error"] = "budget exhausted"
                 return
-            res = await run_node(node, {"id": task_id, "goal": goal, "project_id": project_id}, deps)
+            res = await run_node(node, {"id": task_id, "goal": goal, "project_id": project_id,
+                                        "upstream": collect_upstream(dag, node)}, deps)
             used["tokens"] += res.get("tokens", 0)
             used["usd"] += res.get("cost", 0.0)
             await emit(task_id, res.get("run_id"), "verification_started",
@@ -1604,7 +3582,8 @@ async def execute_task(task_id: str) -> None:
                 await emit(task_id, res.get("run_id"), "verification_failed", v)
                 res = await run_node(node, {"id": task_id,
                                             "goal": goal + "\n[REPAIR] " + str(v["checks"])[:500],
-                                            "project_id": project_id}, deps)
+                                            "project_id": project_id,
+                                            "upstream": collect_upstream(dag, node)}, deps)
                 v = run_verification(node.get("verification", "quality"), res.get("summary", ""))
             SF2 = session_factory()
             async with SF2() as db2:
@@ -1621,10 +3600,17 @@ async def execute_task(task_id: str) -> None:
                               cost_usd=res.get("cost", 0.0), task_id=task_id))
                 t = await db2.get(Task, task_id)
                 if t:
-                    d = dict(t.dag or dag)
+                    d = copy.deepcopy(t.dag or dag)
                     for n in d.get("nodes", []):
                         if n["node_id"] == node["node_id"]:
                             n.update(node)
+                    subtasks = ((res.get("output") or {}).get("plan") or {}).get("subtasks") or []
+                    if subtasks and node.get("status") in ("completed", "approved"):
+                        added = expand_dag(d, node, subtasks, goal)
+                        if added:
+                            await emit(task_id, res.get("run_id"), "task_created",
+                                       {"spawned_by": node["node_id"], "new_nodes": added,
+                                        "reason": "agent identified follow-up work"})
                     t.dag = d
                     t.checkpoint = {"used_tokens": used["tokens"], "used_usd": used["usd"], "at": time.time()}
                 await db2.commit()
@@ -1644,7 +3630,17 @@ async def execute_task(task_id: str) -> None:
             if t.status == "cancelled":
                 await emit(task_id, None, "task_completed", {"status": "cancelled"})
                 return
-            dag = dict(t.dag or dag)
+            dag = copy.deepcopy(t.dag or dag)
+        if dag_expired(dag):
+            async with session_factory()() as db:
+                t = await db.get(Task, task_id)
+                if t:
+                    t.status = "expired"
+                    t.dag = copy.deepcopy(dag)
+                    await db.commit()
+            await emit(task_id, None, "task_completed",
+                       {"status": "expired", "reason": "wall-clock deadline reached"})
+            return
         batch = ready_nodes(dag)
         st = dag_status(dag)
         if st in ("completed", "failed") or not batch:
@@ -1658,7 +3654,7 @@ async def execute_task(task_id: str) -> None:
                     t.status = "awaiting_approval" if st == "awaiting_approval" else "dead"
                 else:
                     t.status = st
-                t.dag = dag
+                t.dag = copy.deepcopy(dag)
                 await db.commit()
                 final = t.status
             await emit(task_id, None, "task_completed", {"status": final})
@@ -1672,7 +3668,7 @@ async def execute_task(task_id: str) -> None:
         SF5 = session_factory()
         async with SF5() as db:
             t = await db.get(Task, task_id)
-            dag = dict((t.dag if t else {}) or dag)
+            dag = copy.deepcopy((t.dag if t else {}) or dag)
 
 
 async def recover_incomplete() -> int:
@@ -1876,16 +3872,40 @@ async def resume_task(task_id: str, user: User = Depends(current_user)):
         t = await db.get(Task, task_id)
         if not t or t.user_id != user.id:
             raise HTTPException(404, "task not found")
-        dag = dict(t.dag or {})
+        dag = copy.deepcopy(t.dag or {})
         for n in dag.get("nodes", []):
             if n.get("status") == "failed":
                 n["status"] = "pending"
                 n["error"] = None
-        t.dag = dag
+        t.dag = copy.deepcopy(dag)
         t.status = "queued"
         await db.commit()
     asyncio.create_task(execute_task(task_id))
     return {"ok": True}
+
+
+@tasks_r.post("/{task_id}/approve")
+async def approve_task(task_id: str, node_id: str = "", user: User = Depends(current_user)):
+    """Clear human approval gates so a gated DAG can continue."""
+    SF = session_factory()
+    async with SF() as db:
+        t = await db.get(Task, task_id)
+        if not t or t.user_id != user.id:
+            raise HTTPException(404, "task not found")
+        dag = copy.deepcopy(t.dag or {})
+        cleared = []
+        for n in dag.get("nodes", []):
+            if n.get("status") == "awaiting_approval" and (not node_id or n["node_id"] == node_id):
+                n["status"] = "approved"
+                cleared.append(n["node_id"])
+        if not cleared:
+            raise HTTPException(400, "no nodes awaiting approval")
+        t.dag = copy.deepcopy(dag)
+        t.status = "queued"
+        await db.commit()
+    await _audit(user.id, "task.approve", task_id, meta={"nodes": cleared})
+    asyncio.create_task(execute_task(task_id))
+    return {"ok": True, "approved": cleared}
 
 
 @tasks_r.get("/{task_id}/events")
@@ -1909,26 +3929,53 @@ async def _check_task_owner(task_id: str, user: User) -> Task:
 
 
 @runs_r.get("/{task_id}/stream")
-@events_r.get("/stream")
-async def stream_events(task_id: str, user: User = Depends(current_user)):
+async def stream_events(task_id: str, token: str = "",
+                        creds: HTTPAuthorizationCredentials | None = Depends(_bearer)):
+    """Server-sent events for a run.
+
+    EventSource cannot set an Authorization header, so a ?token= query parameter is
+    accepted here as well. It is validated exactly like a bearer token.
+    """
+    raw = token or (creds.credentials if creds else "")
+    if not raw:
+        raise HTTPException(401, "missing token")
+    try:
+        payload = decode_token(raw)
+    except Exception:
+        raise HTTPException(401, "invalid token")
+    SF = session_factory()
+    async with SF() as db:
+        user = await db.get(User, payload.get("sub", ""))
+    if not user:
+        raise HTTPException(401, "unknown user")
     await _check_task_owner(task_id, user)
 
     async def gen():
         q = subscribe(task_id)
         try:
-            yield f"event: planning\ndata: {json.dumps({'task': task_id})}\n\n"
+            # replay what already happened so a late subscriber sees the whole run
+            async with session_factory()() as db2:
+                rows = (await db2.execute(
+                    select(TaskEvent).where(TaskEvent.task_id == task_id)
+                    .order_by(TaskEvent.created_at).limit(500))).scalars().all()
+            for r in rows:
+                ev = {"type": r.type, "run_id": r.run_id, "payload": r.payload or {},
+                      "at": r.created_at.timestamp() if r.created_at else time.time(),
+                      "replay": True}
+                yield f"event: {r.type}\ndata: {json.dumps(ev, default=str)}\n\n"
             while True:
                 try:
-                    ev = await asyncio.wait_for(q.get(), timeout=25)
+                    ev = await asyncio.wait_for(q.get(), timeout=20)
                     yield f"event: {ev['type']}\ndata: {json.dumps(ev, default=str)}\n\n"
                     if ev["type"] == "task_completed":
                         break
                 except asyncio.TimeoutError:
-                    yield ": ping\n\n"
+                    yield ": keepalive\n\n"
         finally:
             unsubscribe(task_id, q)
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(gen(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"})
 
 
 @agents_r.get("")
@@ -1941,6 +3988,25 @@ async def list_agents(q: str = ""):
     return [{"id": d.id, "name": d.name, "description": d.description, "capabilities": d.capabilities,
              "tools": d.tools, "cost_level": d.cost_level, "risk_level": d.risk_level,
              "verification": d.verification_strategy, "performance": perf.get(d.id, 0.5)} for d in defs]
+
+
+@agents_r.get("/stats")
+async def agent_stats():
+    by_domain: dict[str, int] = defaultdict(int)
+    for d in REGISTRY.values():
+        by_domain[d.domain] += 1
+    return {"total": len(REGISTRY), "domains": len(by_domain),
+            "by_domain": dict(sorted(by_domain.items())),
+            "human_gated": sum(1 for d in REGISTRY.values() if d.human_gate),
+            "aliases": len(ALIASES), "catalogue": str(AGENT_CATALOGUE_PATH)}
+
+
+@agents_r.post("/reload")
+async def reload_agents(user: User = Depends(current_user)):
+    """Hot-reload the catalogue — add agents without restarting."""
+    n = load_catalogue()
+    await _audit(user.id, "agents.reload", "", "ok", {"loaded": n})
+    return {"loaded": n, "total": len(REGISTRY)}
 
 
 @agents_r.get("/{agent_id}")
@@ -1994,14 +4060,24 @@ async def add_key(body: KeyCreate, user: User = Depends(current_user)):
         prov = (await db.execute(select(Provider).where(Provider.slug == body.provider_slug))).scalars().first()
         if not prov:
             raise HTTPException(404, "provider not found")
-        is_valid = len(body.api_key) >= 8
+        if len(body.api_key) < 8:
+            raise HTTPException(400, "api key looks malformed")
+        # Validate against the provider and pull its model catalogue in one go.
+        disc = await discover_models_for_key(prov.slug, body.api_key, prov.base_url or "")
+        is_valid = bool(disc["ok"])
         row = ProviderKey(user_id=user.id, project_id=body.project_id, provider_id=prov.id,
                           encrypted_blob=encrypt_secret(body.api_key),
                           fingerprint=fingerprint(body.api_key), is_valid=is_valid)
         db.add(row)
         await db.commit()
-        await _audit(user.id, "keys.add", prov.slug)
-        return {"id": row.id, "provider": prov.slug, "fingerprint": row.fingerprint, "is_valid": is_valid}
+        saved = 0
+        if is_valid:
+            saved = await persist_models(db, prov.slug, disc["models"])
+        await _audit(user.id, "keys.add", prov.slug, "ok" if is_valid else "invalid",
+                     {"models_discovered": saved})
+        return {"id": row.id, "provider": prov.slug, "fingerprint": row.fingerprint,
+                "is_valid": is_valid, "models_discovered": saved,
+                "error": disc["error"] or None}
 
 
 @keys_r.get("")
@@ -2031,23 +4107,48 @@ async def delete_key(key_id: str, user: User = Depends(current_user)):
 
 @chat_r.post("")
 async def chat(body: ChatIn, user: User = Depends(current_user)):
+    """Conversational turn. Routes to a single fast call unless real work is requested."""
     SF = session_factory()
     async with SF() as db:
         proj = await db.get(Project, body.project_id)
         if not proj or proj.owner_id != user.id:
             raise HTTPException(404, "project not found")
+
+    intent = classify_intent(body.message)
+    force = (body.mode or "auto").lower()
+    if force in ("chat", "task"):
+        intent = {**intent, "mode": force, "reason": f"forced by client ({force})"}
+
+    if intent["mode"] == "chat":
+        await quota_for(user.id).acquire(estimate_tokens(body.message, 700))
+        hist = body.history or []
+        res = await fast_reply(body.message, hist, body.project_id)
+        await _audit(user.id, "chat.fast", body.project_id, "ok",
+                     {"latency_ms": res["latency_ms"], "cached": res["cached"]})
+        return {"mode": "chat", "intent": intent, "reply": res["reply"],
+                "latency_ms": res["latency_ms"], "cached": res["cached"],
+                "tokens": res["tokens"], "task_id": None}
+
+    # real work -> hand to the orchestrator, return immediately, stream the rest
+    async with SF() as db:
         t = Task(project_id=body.project_id, user_id=user.id, goal=body.message,
                  status="queued", idempotency_key=str(uuid.uuid4()))
         db.add(t)
         await db.commit()
         tid = t.id
-    await execute_task(tid)
-    SF2 = session_factory()
-    async with SF2() as db2:
-        t2 = await db2.get(Task, tid)
-        nodes = (t2.dag or {}).get("nodes", []) if t2 else []
-        outs = [n.get("result", {}).get("output", "") for n in nodes if n.get("result")]
-    return {"task_id": tid, "status": t2.status if t2 else "unknown", "outputs": outs[-2:]}
+    plan = route_goal(body.message)
+    await _audit(user.id, "chat.task", tid, "ok", {"agents": len(plan.steps)})
+    return {"mode": "task", "intent": intent, "task_id": tid, "status": "queued",
+            "planned_agents": [st.agent_id for st in plan.steps],
+            "reply": (f"That needs real work, so I have started a task with "
+                      f"{len(plan.steps)} specialist agents. Stream it at "
+                      f"/v1/runs/{tid}/stream.")}
+
+
+@chat_r.post("/classify")
+async def classify(body: ChatIn, user: User = Depends(current_user)):
+    """Inspect routing without spending anything."""
+    return classify_intent(body.message)
 
 
 @tools_r.get("")
@@ -2121,6 +4222,56 @@ async def list_artifacts(project_id: str, user: User = Depends(current_user)):
         return [{"id": r.id, "kind": r.kind, "uri": r.uri, "approved": r.approved} for r in rows]
 
 
+@sandbox_r.get("/capabilities")
+async def sandbox_capabilities():
+    """Exactly which isolation layers are live on this machine — no marketing claims."""
+    rep = isolation_report()
+    rep["limits"] = {
+        "cpu_seconds": ExecLimits.cpu_seconds, "memory_mb": ExecLimits.memory_mb,
+        "wall_seconds": ExecLimits.wall_seconds, "max_processes": ExecLimits.max_processes,
+        "file_size_mb": ExecLimits.file_size_mb, "max_output_chars": ExecLimits.max_output,
+    }
+    return rep
+
+
+@providers_r.get("/limits")
+async def provider_limits():
+    """Live rate-limit state per provider, including adaptive throttling."""
+    return {"defaults": FREE_TIER_DEFAULTS,
+            "live": {p: g.snapshot() for p, g in GATES.items()},
+            "note": ("Defaults are starting points for known free tiers and will drift as "
+                     "providers change them. Override with PROVIDER_LIMITS_JSON. Every gate "
+                     "also shrinks itself automatically on a 429 and recovers on success.")}
+
+
+@models_r.post("/refresh")
+async def refresh_models(provider_slug: str = "", user: User = Depends(current_user)):
+    """Re-discover models using the user's stored keys."""
+    SF = session_factory()
+    out: dict[str, Any] = {}
+    async with SF() as db:
+        q = select(ProviderKey).where(ProviderKey.user_id == user.id)
+        keys = (await db.execute(q)).scalars().all()
+        for k in keys:
+            prov = await db.get(Provider, k.provider_id)
+            if not prov or (provider_slug and prov.slug != provider_slug):
+                continue
+            try:
+                plain = decrypt_secret(k.encrypted_blob)
+            except Exception:
+                out[prov.slug] = {"ok": False, "error": "key could not be decrypted"}
+                continue
+            disc = await discover_models_for_key(prov.slug, plain, prov.base_url or "")
+            del plain
+            if disc["ok"]:
+                n = await persist_models(db, prov.slug, disc["models"])
+                out[prov.slug] = {"ok": True, "models": n}
+            else:
+                out[prov.slug] = {"ok": False, "error": disc["error"]}
+    await _audit(user.id, "models.refresh", provider_slug or "all")
+    return out
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     data_dir()
@@ -2128,64 +4279,55 @@ async def lifespan(app: FastAPI):
     SF = session_factory()
     async with SF() as db:
         await seed_providers(db)
-        have = {r.slug for r in (await db.execute(select(Agent))).scalars().all()}
-        for d in REGISTRY.values():
-            if d.id not in have:
-                db.add(Agent(slug=d.id, name=d.name, description=d.description,
-                             capabilities=d.capabilities, tools=d.tools,
-                             model_requirements=d.model_requirements, cost_level=d.cost_level,
-                             risk_level=d.risk_level, permissions=d.permissions,
-                             system_prompt=d.system_instructions,
-                             verification_strategy=d.verification_strategy, version=d.version))
+        have = {row[0] for row in (await db.execute(select(Agent.slug))).all()}
+        rows = [dict(id=_uid(), slug=d.id, name=d.name, description=d.description,
+                     capabilities=d.capabilities, tools=d.tools,
+                     model_requirements=d.model_requirements, cost_level=d.cost_level,
+                     risk_level=d.risk_level, permissions=d.permissions,
+                     system_prompt=d.system_instructions,
+                     verification_strategy=d.verification_strategy, version=d.version,
+                     enabled=True, performance_score=0.5)
+                for d in REGISTRY.values() if d.id not in have]
+        if rows:
+            await db.execute(Agent.__table__.insert(), rows)   # one statement, not 480
         await db.commit()
     await recover_incomplete()
-    log.info("Maximus ready: %d agents", len(REGISTRY))
-    yield
+    log.info("Maximus ready: %d agents across %d domains | isolation=%s",
+             len(REGISTRY), len({d.domain for d in REGISTRY.values()}), ISOLATION_MODE)
+    try:
+        yield
+    finally:
+        await close_http()
 
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Maximus AI", version="1.0.0",
-                  description="Autonomous multi-agent OS — single-file local build. OmniRoute = model gateway.",
+                  description="Autonomous multi-agent OS — local-first. OmniRoute = model gateway.",
                   lifespan=lifespan)
-    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-    # serve frontend index.html at / if present (Claude-style minimal frontend)
-    try:
-        from fastapi.staticfiles import StaticFiles as _SF
-        from fastapi.responses import FileResponse as _FR
-        _idx = BASE_DIR / "index.html"
-        if _idx.exists():
-            @app.get("/app", include_in_schema=False)
-            async def _serve_index():
-                return _FR(str(_idx), media_type="text/html")
-            # also mount at / when Accept prefers html (keeps / JSON for API clients)
-            _orig_root = None
-            @app.get("/", include_in_schema=False)
-            async def root(request=None):
-                try:
-                    from fastapi import Request as _Req
-                    # if browser request, serve html; otherwise JSON
-                    if request is not None:
-                        accept = ""
-                        try:
-                            accept = request.headers.get("accept", "")
-                        except Exception:
-                            pass
-                        if "text/html" in accept:
-                            return _FR(str(_idx), media_type="text/html")
-                except Exception:
-                    pass
-                return {"app": S.APP_NAME, "agents": len(REGISTRY), "docs": "/docs",
-                        "principle": "MAXIMUS=orchestration, OMNIROUTE=models, MCP=tools, SANDBOX=execution, MEMORY=context"}
-        else:
-            @app.get("/")
-            async def root():
-                return {"app": S.APP_NAME, "agents": len(REGISTRY), "docs": "/docs",
-                        "principle": "MAXIMUS=orchestration, OMNIROUTE=models, MCP=tools, SANDBOX=execution, MEMORY=context"}
-    except Exception:
-        @app.get("/")
-        async def root():
-            return {"app": S.APP_NAME, "agents": len(REGISTRY), "docs": "/docs",
-                    "principle": "MAXIMUS=orchestration, OMNIROUTE=models, MCP=tools, SANDBOX=execution, MEMORY=context"}
+    app.add_middleware(CORSMiddleware,
+                       allow_origins=_env("CORS_ORIGINS", "*").split(","),
+                       allow_methods=["*"], allow_headers=["*"])
+
+    index = BASE_DIR / "index.html"
+
+    @app.get("/", include_in_schema=False)
+    async def root(request: Request):
+        # Browsers get the control room; API clients get JSON from the same path.
+        if index.exists() and "text/html" in request.headers.get("accept", ""):
+            return FileResponse(str(index), media_type="text/html")
+        return JSONResponse({
+            "app": S.APP_NAME, "agents": len(REGISTRY),
+            "domains": len({d.domain for d in REGISTRY.values()}),
+            "ui": "/app" if index.exists() else None, "docs": "/docs",
+            "isolation": ISOLATION_MODE,
+            "principle": "MAXIMUS=orchestration, OMNIROUTE=models, MCP=tools, "
+                         "SANDBOX=local execution, MEMORY=context"})
+
+    @app.get("/app", include_in_schema=False)
+    async def ui():
+        if not index.exists():
+            raise HTTPException(404, "index.html is not next to app.py")
+        return FileResponse(str(index), media_type="text/html")
 
     @app.get("/health")
     async def health():
@@ -2201,6 +4343,10 @@ def create_app() -> FastAPI:
         except Exception:
             db_ok = False
         return {"ready": db_ok, "agents": len(REGISTRY)}
+
+    for _r in (auth_r, chat_r, tasks_r, projects_r, agents_r, models_r, providers_r,
+               keys_r, tools_r, mcp_r, memory_r, sandbox_r, artifacts_r, runs_r, events_r):
+        app.include_router(_r, prefix="/v1")
 
     return app
 
