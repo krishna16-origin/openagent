@@ -57,11 +57,6 @@ main{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.45fr) 3
 .muted{color:var(--dim)} .faint{color:var(--faint)}
 .small{font-size:12.5px}
 
-/* ---------- auth ---------- */
-#gate{position:fixed;inset:0;background:var(--bg);display:grid;place-items:center;z-index:50}
-#gate .box{width:330px;display:flex;flex-direction:column;gap:11px}
-#gate h1{font-size:20px;margin:0 0 2px;font-weight:600;letter-spacing:-.02em}
-
 /* ---------- conversation ---------- */
 #thread{display:flex;flex-direction:column;gap:11px;flex:1;min-height:0}
 .msg{border-radius:var(--r);padding:10px 13px;max-width:100%;white-space:pre-wrap;
@@ -114,6 +109,13 @@ main{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.45fr) 3
 .hit{padding:6px 8px;border:1px solid var(--line-soft);border-radius:var(--r);font-size:12.5px}
 .hit .id{font-family:var(--mono);font-size:11px;color:var(--faint);display:block}
 
+.keyrow{display:flex;align-items:center;gap:9px;padding:7px 9px;
+  border:1px solid var(--line-soft);border-radius:var(--r);font-size:12.5px}
+.keyrow .kmeta{flex:1;min-width:0}
+.keyrow .kprov{font-weight:600;text-transform:capitalize}
+.keyrow .kfp{font-family:var(--mono);font-size:11px;color:var(--faint)}
+.keyrow button{padding:3px 9px;font-size:11.5px}
+
 .empty{color:var(--faint);font-size:12.5px;padding:14px;text-align:center}
 .err{color:var(--fail);font-size:12.5px}
 
@@ -127,27 +129,12 @@ main{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.45fr) 3
 </head>
 <body>
 
-<div id="gate">
-  <div class="box">
-    <h1>Maximus</h1>
-    <p class="muted small" style="margin:0 0 6px">Sign in to your local instance. Data stays on this machine.</p>
-    <input id="gEmail" type="email" placeholder="you@example.com" autocomplete="username">
-    <input id="gPass" type="password" placeholder="Password" autocomplete="current-password">
-    <div class="row">
-      <button id="gLogin" style="flex:1">Sign in</button>
-      <button id="gReg" style="flex:1">Create account</button>
-    </div>
-    <div id="gErr" class="err"></div>
-  </div>
-</div>
-
-<div id="app" hidden>
+<div id="app">
   <header>
     <div class="brand">Maximus<span id="hAgents">loading catalogue</span></div>
     <div class="spacer"></div>
     <span class="pill"><i class="dot" id="dIso"></i><span id="tIso">isolation</span></span>
     <span class="pill"><i class="dot" id="dGw"></i><span id="tGw">gateway</span></span>
-    <button id="btnOut">Sign out</button>
   </header>
 
   <main>
@@ -212,6 +199,23 @@ main{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.45fr) 3
       </div>
 
       <div class="card">
+        <h2>API keys (BYOK)</h2>
+        <div class="body">
+          <div class="muted small" style="margin:0 0 8px">
+            Use your own provider key instead of the shared gateway. Keys are encrypted at rest and never shown again.
+          </div>
+          <select id="pkProvider"></select>
+          <input id="pkKey" type="password" placeholder="Paste API key" autocomplete="off"
+                 style="margin-top:7px">
+          <div class="row" style="margin-top:8px">
+            <button id="pkSave" style="flex:1">Save key</button>
+          </div>
+          <div id="pkMsg" class="small" style="margin-top:6px"></div>
+          <div id="pkList" style="margin-top:10px;display:flex;flex-direction:column;gap:6px"></div>
+        </div>
+      </div>
+
+      <div class="card">
         <h2>Find an agent</h2>
         <div class="body">
           <input id="qAgent" placeholder="security audit, tax filing, shaders">
@@ -248,30 +252,31 @@ async function api(method, path, body) {
   return data;
 }
 
-/* ---------------- auth ---------------- */
-async function enter(mode) {
-  const email = $('#gEmail').value.trim(), password = $('#gPass').value;
-  $('#gErr').textContent = '';
-  if (!email || password.length < 8) {
-    $('#gErr').textContent = 'Enter an email and a password of at least 8 characters.'; return;
+/* ---------------- local identity ----------------
+   No sign-in screen: each browser gets one quiet, auto-provisioned account so
+   BYOK keys, projects and chat (all of which are per-user) have a home. */
+async function ensureAuth() {
+  if (TOKEN) {
+    try { await api('GET', '/v1/auth/me'); return; } catch { TOKEN = ''; }
   }
-  try {
-    const r = await api('POST', mode === 'reg' ? '/v1/auth/register' : '/v1/auth/login',
-                        {email, password});
-    TOKEN = r.access_token; localStorage.setItem('mx_token', TOKEN);
-    await boot();
-  } catch (e) { $('#gErr').textContent = e.message; }
+  let email = localStorage.getItem('mx_id_email');
+  let pass = localStorage.getItem('mx_id_pass');
+  if (!email) {
+    email = 'local-' + crypto.randomUUID() + '@device.local';
+    pass = crypto.randomUUID() + crypto.randomUUID();
+    localStorage.setItem('mx_id_email', email);
+    localStorage.setItem('mx_id_pass', pass);
+  }
+  let r;
+  try { r = await api('POST', '/v1/auth/login', {email, password: pass}); }
+  catch { r = await api('POST', '/v1/auth/register', {email, password: pass}); }
+  TOKEN = r.access_token;
+  localStorage.setItem('mx_token', TOKEN);
 }
-$('#gLogin').onclick = () => enter('login');
-$('#gReg').onclick = () => enter('reg');
-$('#gPass').onkeydown = e => { if (e.key === 'Enter') enter('login'); };
-$('#btnOut').onclick = () => { localStorage.clear(); location.reload(); };
 
 /* ---------------- boot ---------------- */
 async function boot() {
-  try { await api('GET', '/v1/auth/me'); }
-  catch { $('#gate').hidden = false; $('#app').hidden = true; return; }
-  $('#gate').hidden = true; $('#app').hidden = false;
+  await ensureAuth();
 
   if (!PROJECT) {
     const list = await api('GET', '/v1/projects');
@@ -304,6 +309,9 @@ async function boot() {
 
   refreshLimits();
   setInterval(refreshLimits, 6000);
+
+  loadProviders();
+  loadKeys();
 }
 
 /* ---------------- conversation ---------------- */
@@ -498,6 +506,62 @@ async function refreshLimits() {
     box.appendChild(s);
   });
 }
+
+/* ---------------- BYOK provider keys ---------------- */
+async function loadProviders() {
+  const sel = $('#pkProvider');
+  try {
+    const provs = await api('GET', '/v1/providers');
+    sel.textContent = '';
+    provs.forEach(p => {
+      const o = document.createElement('option');
+      o.value = p.slug; o.textContent = p.name;
+      sel.appendChild(o);
+    });
+  } catch { sel.textContent = ''; sel.appendChild(el('option', '', 'Providers unavailable')); }
+}
+
+async function loadKeys() {
+  const list = $('#pkList');
+  let keys;
+  try { keys = await api('GET', '/v1/keys'); } catch { return; }
+  list.textContent = '';
+  if (!keys.length) { list.appendChild(el('div', 'empty', 'No keys saved yet.')); return; }
+  keys.forEach(k => {
+    const row = el('div', 'keyrow');
+    row.appendChild(el('i', 'dot ' + (k.is_valid ? 'ok' : 'bad')));
+    const meta = el('div', 'kmeta');
+    meta.appendChild(el('div', 'kprov', k.provider));
+    meta.appendChild(el('div', 'kfp', k.fingerprint + (k.is_valid ? '' : ' · rejected by provider')));
+    row.appendChild(meta);
+    const del = el('button', '', 'Remove');
+    del.onclick = async () => {
+      del.disabled = true;
+      try { await api('DELETE', '/v1/keys/' + k.id); loadKeys(); }
+      catch (e) { alert(e.message); del.disabled = false; }
+    };
+    row.appendChild(del);
+    list.appendChild(row);
+  });
+}
+
+$('#pkSave').onclick = async () => {
+  const provider_slug = $('#pkProvider').value;
+  const api_key = $('#pkKey').value.trim();
+  const msg = $('#pkMsg'); msg.textContent = ''; msg.classList.remove('err');
+  if (!provider_slug) { msg.textContent = 'Pick a provider first.'; msg.classList.add('err'); return; }
+  if (api_key.length < 8) { msg.textContent = 'That key looks too short.'; msg.classList.add('err'); return; }
+  $('#pkSave').disabled = true;
+  try {
+    const r = await api('POST', '/v1/keys', {provider_slug, api_key, project_id: PROJECT});
+    $('#pkKey').value = '';
+    if (r.is_valid) msg.textContent = 'Saved — ' + r.models_discovered + ' model(s) found.';
+    else { msg.textContent = 'Saved, but the provider rejected it: ' + (r.error || 'invalid key'); msg.classList.add('err'); }
+    loadKeys();
+  } catch (e) { msg.textContent = e.message; msg.classList.add('err'); }
+  finally { $('#pkSave').disabled = false; }
+};
+$('#pkKey').addEventListener('keydown', e => { if (e.key === 'Enter') $('#pkSave').click(); });
 
 /* ---------------- agent search ---------------- */
 let qt;
