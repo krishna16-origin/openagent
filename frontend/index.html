@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Maximus</title>
+<style>
+:root{
+  --bg:#1f2124; --panel:#26292d; --panel-2:#2c3035; --line:#353a40; --line-soft:#2e3237;
+  --text:#dcdfe3; --dim:#9aa1a8; --faint:#6e757c;
+  --run:#d8a657; --done:#7fa87f; --fail:#c9706e; --gate:#9b88c6; --wait:#5f676d;
+  --accent:#8fb3d9;
+  --r:6px;
+  --sans:ui-sans-serif,-apple-system,"Segoe UI",Roboto,Inter,"Helvetica Neue",sans-serif;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--text);font:400 14px/1.55 var(--sans);
+  -webkit-font-smoothing:antialiased}
+button,input,textarea,select{font:inherit;color:inherit}
+button{cursor:pointer;background:var(--panel-2);border:1px solid var(--line);
+  border-radius:var(--r);padding:7px 13px;transition:background .12s,border-color .12s}
+button:hover{background:#343940;border-color:#434a52}
+button:disabled{opacity:.45;cursor:not-allowed}
+button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+input,textarea,select{background:#1b1d20;border:1px solid var(--line);border-radius:var(--r);
+  padding:8px 11px;width:100%}
+input:focus,textarea:focus{border-color:#4a525b;outline:none}
+a{color:var(--accent)}
+.mono{font-family:var(--mono);font-size:12px}
+
+/* ---------- shell ---------- */
+#app{display:grid;grid-template-rows:auto 1fr;height:100%}
+header{display:flex;align-items:center;gap:14px;padding:11px 18px;
+  border-bottom:1px solid var(--line);background:var(--panel)}
+.brand{font-weight:600;letter-spacing:-.01em}
+.brand span{color:var(--faint);font-weight:400;margin-left:8px;font-size:12.5px}
+.spacer{flex:1}
+.pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--dim);
+  border:1px solid var(--line);border-radius:100px;padding:3px 10px;background:#22262a}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--faint);flex:none}
+.dot.ok{background:var(--done)} .dot.warn{background:var(--run)} .dot.bad{background:var(--fail)}
+
+main{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.45fr) 300px;
+  overflow:hidden}
+.col{overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:14px}
+.col+.col{border-left:1px solid var(--line)}
+.col::-webkit-scrollbar{width:9px}
+.col::-webkit-scrollbar-thumb{background:#363b41;border-radius:9px}
+
+.card{background:var(--panel);border:1px solid var(--line-soft);border-radius:var(--r)}
+.card h2{margin:0;padding:11px 14px;font-size:12.5px;font-weight:600;color:var(--dim);
+  border-bottom:1px solid var(--line-soft)}
+.card .body{padding:13px 14px}
+.row{display:flex;gap:9px;align-items:center}
+.muted{color:var(--dim)} .faint{color:var(--faint)}
+.small{font-size:12.5px}
+
+/* ---------- auth ---------- */
+#gate{position:fixed;inset:0;background:var(--bg);display:grid;place-items:center;z-index:50}
+#gate .box{width:330px;display:flex;flex-direction:column;gap:11px}
+#gate h1{font-size:20px;margin:0 0 2px;font-weight:600;letter-spacing:-.02em}
+
+/* ---------- conversation ---------- */
+#thread{display:flex;flex-direction:column;gap:11px;flex:1;min-height:0}
+.msg{border-radius:var(--r);padding:10px 13px;max-width:100%;white-space:pre-wrap;
+  word-break:break-word;border:1px solid transparent}
+.msg.me{background:#2f353c;align-self:flex-end;max-width:85%}
+.msg.bot{background:var(--panel);border-color:var(--line-soft)}
+.msg .meta{font-size:11.5px;color:var(--faint);margin-top:7px;display:flex;gap:10px;
+  font-family:var(--mono)}
+.composer{display:flex;gap:8px;align-items:flex-end}
+.composer textarea{resize:none;min-height:42px;max-height:150px}
+
+/* ---------- run view ---------- */
+.phase-rail{display:flex;gap:0;margin:0;padding:0;list-style:none;flex-wrap:wrap}
+.phase-rail li{flex:1;min-width:64px;padding:7px 4px 6px;text-align:center;font-size:11.5px;
+  color:var(--faint);border-bottom:2px solid var(--line);position:relative}
+.phase-rail li.on{color:var(--text);border-bottom-color:var(--run)}
+.phase-rail li.past{color:var(--dim);border-bottom-color:var(--done)}
+
+.agent{border:1px solid var(--line-soft);border-radius:var(--r);background:var(--panel-2);
+  padding:9px 11px;display:flex;flex-direction:column;gap:5px}
+.agent .top{display:flex;align-items:center;gap:8px}
+.agent .name{font-weight:500}
+.agent .id{font-family:var(--mono);font-size:11px;color:var(--faint)}
+.agent .status{margin-left:auto;font-size:11.5px;color:var(--dim)}
+.agent .work{font-size:12.5px;color:var(--dim)}
+.agent .bar{height:2px;background:var(--line);border-radius:2px;overflow:hidden}
+.agent .bar i{display:block;height:100%;width:0;background:var(--run);transition:width .3s}
+.agent[data-s="completed"] .bar i,.agent[data-s="approved"] .bar i{width:100%;background:var(--done)}
+.agent[data-s="failed"] .bar i{width:100%;background:var(--fail)}
+.agent[data-s="awaiting_approval"] .bar i{width:100%;background:var(--gate)}
+.agent[data-s="running"] .bar i{width:60%}
+.grid{display:grid;gap:8px}
+
+#log{display:flex;flex-direction:column;gap:2px;max-height:280px;overflow-y:auto}
+.line{display:flex;gap:9px;padding:4px 0;border-bottom:1px solid var(--line-soft);font-size:12.5px}
+.line time{font-family:var(--mono);font-size:11px;color:var(--faint);flex:none;width:58px}
+.line .what{color:var(--dim)}
+.line .what b{color:var(--text);font-weight:500}
+
+/* ---------- vitals ---------- */
+.stat{display:flex;justify-content:space-between;gap:10px;padding:5px 0;font-size:12.5px}
+.stat b{font-family:var(--mono);font-weight:500;font-size:12px}
+.meter{height:3px;background:var(--line);border-radius:3px;overflow:hidden;margin-top:3px}
+.meter i{display:block;height:100%;background:var(--accent)}
+.meter i.hot{background:var(--run)} .meter i.over{background:var(--fail)}
+
+.chip{display:inline-block;font-size:11.5px;color:var(--dim);border:1px solid var(--line);
+  border-radius:100px;padding:2px 9px;margin:0 4px 4px 0;font-family:var(--mono)}
+#agentList{max-height:240px;overflow-y:auto;display:flex;flex-direction:column;gap:5px}
+.hit{padding:6px 8px;border:1px solid var(--line-soft);border-radius:var(--r);font-size:12.5px}
+.hit .id{font-family:var(--mono);font-size:11px;color:var(--faint);display:block}
+
+.empty{color:var(--faint);font-size:12.5px;padding:14px;text-align:center}
+.err{color:var(--fail);font-size:12.5px}
+
+@media (max-width:1100px){
+  main{grid-template-columns:1fr;grid-auto-rows:min-content}
+  .col+.col{border-left:none;border-top:1px solid var(--line)}
+  .col{max-height:none}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+
+<div id="gate">
+  <div class="box">
+    <h1>Maximus</h1>
+    <p class="muted small" style="margin:0 0 6px">Sign in to your local instance. Data stays on this machine.</p>
+    <input id="gEmail" type="email" placeholder="you@example.com" autocomplete="username">
+    <input id="gPass" type="password" placeholder="Password" autocomplete="current-password">
+    <div class="row">
+      <button id="gLogin" style="flex:1">Sign in</button>
+      <button id="gReg" style="flex:1">Create account</button>
+    </div>
+    <div id="gErr" class="err"></div>
+  </div>
+</div>
+
+<div id="app" hidden>
+  <header>
+    <div class="brand">Maximus<span id="hAgents">loading catalogue</span></div>
+    <div class="spacer"></div>
+    <span class="pill"><i class="dot" id="dIso"></i><span id="tIso">isolation</span></span>
+    <span class="pill"><i class="dot" id="dGw"></i><span id="tGw">gateway</span></span>
+    <button id="btnOut">Sign out</button>
+  </header>
+
+  <main>
+    <!-- conversation -->
+    <section class="col">
+      <div class="card" style="display:flex;flex-direction:column;flex:1;min-height:340px">
+        <h2>Conversation</h2>
+        <div class="body" style="display:flex;flex-direction:column;gap:12px;flex:1;min-height:0">
+          <div id="thread"></div>
+          <div class="composer">
+            <textarea id="say" rows="1" placeholder="Ask a question, or describe work to be done"></textarea>
+            <button id="send">Send</button>
+          </div>
+          <div class="faint small" id="hint">Short questions answer instantly. Requests for real
+            work start a task with specialist agents.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- live run -->
+    <section class="col">
+      <div class="card">
+        <h2>Current run</h2>
+        <div class="body">
+          <div id="runHead" class="empty">No run yet. Ask for something to be built, researched or written.</div>
+          <ol class="phase-rail" id="rail" hidden>
+            <li data-p="analyze">Understand</li><li data-p="research">Research</li>
+            <li data-p="design">Design</li><li data-p="implement">Build</li>
+            <li data-p="verify">Verify</li><li data-p="deliver">Deliver</li>
+            <li data-p="synthesize">Review</li>
+          </ol>
+          <div id="approve" hidden style="margin-top:12px">
+            <div class="small" style="margin-bottom:7px">This run is paused. A high-risk step needs your approval before it continues.</div>
+            <button id="btnApprove">Approve and continue</button>
+            <button id="btnCancel">Cancel run</button>
+          </div>
+          <div class="grid" id="agents" style="margin-top:12px"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>What is happening</h2>
+        <div class="body"><div id="log"><div class="empty">Activity appears here as agents work.</div></div></div>
+      </div>
+    </section>
+
+    <!-- vitals -->
+    <section class="col">
+      <div class="card">
+        <h2>This run</h2>
+        <div class="body">
+          <div class="stat"><span>Agents working</span><b id="vAgents">0</b></div>
+          <div class="stat"><span>Steps done</span><b id="vDone">0 / 0</b></div>
+          <div class="stat"><span>Tokens used</span><b id="vTok">0</b></div>
+          <div class="stat"><span>Elapsed</span><b id="vTime">0s</b></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Provider budget</h2>
+        <div class="body" id="limits"><div class="empty">No provider calls yet.</div></div>
+      </div>
+
+      <div class="card">
+        <h2>Find an agent</h2>
+        <div class="body">
+          <input id="qAgent" placeholder="security audit, tax filing, shaders">
+          <div id="agentList" style="margin-top:9px"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Tools available</h2>
+        <div class="body"><div id="tools" class="small muted">loading</div></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const el = (t, c, txt) => { const n = document.createElement(t); if (c) n.className = c;
+  if (txt !== undefined) n.textContent = txt; return n; };
+let TOKEN = localStorage.getItem('mx_token') || '';
+let PROJECT = localStorage.getItem('mx_project') || '';
+let TASK = null, ES = null, T0 = 0, TIMER = null;
+
+async function api(method, path, body) {
+  const r = await fetch(path, {
+    method,
+    headers: Object.assign({'Content-Type': 'application/json'},
+                           TOKEN ? {Authorization: 'Bearer ' + TOKEN} : {}),
+    body: body === undefined ? undefined : JSON.stringify(body)
+  });
+  const txt = await r.text();
+  let data; try { data = txt ? JSON.parse(txt) : {}; } catch { data = {raw: txt}; }
+  if (!r.ok) throw new Error(data.detail || data.error || ('HTTP ' + r.status));
+  return data;
+}
+
+/* ---------------- auth ---------------- */
+async function enter(mode) {
+  const email = $('#gEmail').value.trim(), password = $('#gPass').value;
+  $('#gErr').textContent = '';
+  if (!email || password.length < 8) {
+    $('#gErr').textContent = 'Enter an email and a password of at least 8 characters.'; return;
+  }
+  try {
+    const r = await api('POST', mode === 'reg' ? '/v1/auth/register' : '/v1/auth/login',
+                        {email, password});
+    TOKEN = r.access_token; localStorage.setItem('mx_token', TOKEN);
+    await boot();
+  } catch (e) { $('#gErr').textContent = e.message; }
+}
+$('#gLogin').onclick = () => enter('login');
+$('#gReg').onclick = () => enter('reg');
+$('#gPass').onkeydown = e => { if (e.key === 'Enter') enter('login'); };
+$('#btnOut').onclick = () => { localStorage.clear(); location.reload(); };
+
+/* ---------------- boot ---------------- */
+async function boot() {
+  try { await api('GET', '/v1/auth/me'); }
+  catch { $('#gate').hidden = false; $('#app').hidden = true; return; }
+  $('#gate').hidden = true; $('#app').hidden = false;
+
+  if (!PROJECT) {
+    const list = await api('GET', '/v1/projects');
+    const p = list[0] || await api('POST', '/v1/projects', {name: 'Workspace'});
+    PROJECT = p.id; localStorage.setItem('mx_project', PROJECT);
+  }
+
+  api('GET', '/v1/agents/stats').then(s => {
+    $('#hAgents').textContent = s.total + ' agents across ' + s.domains + ' fields';
+  }).catch(() => {});
+
+  api('GET', '/v1/sandboxes/capabilities').then(c => {
+    const full = c.hard_guarantee;
+    $('#dIso').className = 'dot ' + (full ? 'ok' : 'warn');
+    $('#tIso').textContent = full ? 'Code runs sealed off' : 'Partial isolation';
+    $('#tIso').title = c.note;
+  }).catch(() => {});
+
+  api('GET', '/v1/providers/health').then(h => {
+    const up = h.status === 'healthy';
+    $('#dGw').className = 'dot ' + (up ? 'ok' : 'bad');
+    $('#tGw').textContent = up ? 'Models connected' : 'No model gateway';
+  }).catch(() => { $('#dGw').className = 'dot bad'; $('#tGw').textContent = 'No model gateway'; });
+
+  api('GET', '/v1/tools').then(ts => {
+    $('#tools').textContent = '';
+    ts.forEach(t => { const c = el('span', 'chip', t.name); c.title = t.description;
+      $('#tools').appendChild(c); });
+  }).catch(() => {});
+
+  refreshLimits();
+  setInterval(refreshLimits, 6000);
+}
+
+/* ---------------- conversation ---------------- */
+function bubble(who, text, meta) {
+  const m = el('div', 'msg ' + who, text);
+  if (meta) m.appendChild(el('div', 'meta', meta));
+  $('#thread').appendChild(m);
+  $('#thread').scrollTop = $('#thread').scrollHeight;
+  return m;
+}
+
+const box = $('#say');
+box.addEventListener('input', () => {
+  box.style.height = 'auto'; box.style.height = Math.min(box.scrollHeight, 150) + 'px';
+});
+box.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+$('#send').onclick = send;
+
+async function send() {
+  const text = box.value.trim(); if (!text) return;
+  box.value = ''; box.style.height = 'auto';
+  bubble('me', text);
+  const thinking = bubble('bot', 'Working on it');
+  $('#send').disabled = true;
+  const started = performance.now();
+  try {
+    const r = await api('POST', '/v1/chat', {project_id: PROJECT, message: text});
+    const rt = Math.round(performance.now() - started);
+    thinking.textContent = r.reply || '(no reply)';
+    if (r.mode === 'chat') {
+      thinking.appendChild(el('div', 'meta',
+        'answered directly · ' + rt + ' ms' + (r.cached ? ' · from cache' : '')));
+    } else {
+      thinking.appendChild(el('div', 'meta',
+        (r.planned_agents ? r.planned_agents.length : 0) + ' agents assigned · planned in ' + rt + ' ms'));
+      watch(r.task_id, text);
+    }
+  } catch (e) {
+    thinking.textContent = 'That did not go through: ' + e.message;
+    thinking.classList.add('err');
+  } finally { $('#send').disabled = false; box.focus(); }
+}
+
+/* ---------------- run view ---------------- */
+const PHASE_OF = {analyze: 'analyze', research: 'research', design: 'design',
+  implement: 'implement', verify: 'verify', deliver: 'deliver', synthesize: 'synthesize'};
+
+const SAY = {
+  planning:            () => 'Working out which specialists this needs',
+  agent_selected:      p => 'Assigned ' + nice(p.agent),
+  task_created:        p => p.new_nodes ? (nice(p.spawned_by) + ' added ' + p.new_nodes + ' follow-up steps')
+                                        : 'Queued a step',
+  agent_started:       p => (p.name || nice(p.agent)) + ' started',
+  thinking:            p => (nice(p.agent) + ' is ' + (p.status || 'working')),
+  tool_started:        p => 'Using ' + p.tool,
+  tool_completed:      p => 'Finished with ' + p.tool,
+  agent_completed:     p => (nice(p.agent) + ' finished' + (p.latency_ms ? ' in ' + (p.latency_ms/1000).toFixed(1) + 's' : '')),
+  verification_started:p => 'Checking ' + nice(p.node || '') + ' output (' + (p.strategy || 'quality') + ')',
+  verification_failed: p => 'Check failed, sending it back for repair',
+  retrying:            p => nice(p.agent) + ' hit a problem, retrying (attempt ' + (p.attempt || '?') + ')',
+  task_completed:      p => 'Run ' + (p.status || 'finished')
+};
+function nice(id) {
+  if (!id) return 'a step';
+  const role = String(id).split('.').pop().replace(/_/g, ' ');
+  return role.charAt(0).toUpperCase() + role.slice(1);
+}
+
+function watch(taskId, goal) {
+  TASK = taskId; T0 = Date.now();
+  $('#runHead').textContent = goal;
+  $('#runHead').className = 'small';
+  $('#rail').hidden = false;
+  $('#log').textContent = '';
+  $('#agents').textContent = '';
+  clearInterval(TIMER);
+  TIMER = setInterval(() => {
+    $('#vTime').textContent = Math.round((Date.now() - T0) / 1000) + 's';
+  }, 1000);
+
+  if (ES) ES.close();
+  ES = new EventSource('/v1/runs/' + taskId + '/stream?token=' + encodeURIComponent(TOKEN));
+  ['planning','agent_selected','task_created','agent_started','thinking','tool_started',
+   'tool_completed','agent_completed','verification_started','verification_failed',
+   'retrying','task_completed'].forEach(t => ES.addEventListener(t, ev => {
+      let d = {}; try { d = JSON.parse(ev.data); } catch {}
+      onEvent(t, d.payload || {}, d.replay);
+   }));
+  ES.onerror = () => { /* browser retries automatically */ };
+  poll();
+}
+
+function onEvent(type, p, replay) {
+  const fn = SAY[type];
+  const line = el('div', 'line');
+  line.appendChild(el('time', '', new Date().toLocaleTimeString([], {hour12:false})));
+  const what = el('span', 'what');
+  what.innerHTML = '<b>' + escapeHtml(type.replace(/_/g, ' ')) + '</b> ' +
+                   escapeHtml(fn ? fn(p) : '');
+  line.appendChild(what);
+  const log = $('#log');
+  if (log.querySelector('.empty')) log.textContent = '';
+  log.appendChild(line);
+  if (!replay) log.scrollTop = log.scrollHeight;
+  if (type === 'task_completed') { clearInterval(TIMER); poll(); }
+}
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+async function poll() {
+  if (!TASK) return;
+  let t; try { t = await api('GET', '/v1/tasks/' + TASK); } catch { return; }
+  const nodes = (t.dag && t.dag.nodes) || [];
+  const done = nodes.filter(n => ['completed','approved','skipped'].includes(n.status)).length;
+  const running = nodes.filter(n => n.status === 'running').length;
+  $('#vDone').textContent = done + ' / ' + nodes.length;
+  $('#vAgents').textContent = running;
+  $('#vTok').textContent = ((t.checkpoint && t.checkpoint.used_tokens) || 0).toLocaleString();
+
+  const gated = nodes.some(n => n.status === 'awaiting_approval');
+  $('#approve').hidden = !gated;
+
+  const wrap = $('#agents'); wrap.textContent = '';
+  nodes.forEach(n => {
+    const a = el('div', 'agent'); a.dataset.s = n.status;
+    const top = el('div', 'top');
+    top.appendChild(el('span', 'name', nice(n.agent_id)));
+    top.appendChild(el('span', 'id', n.agent_id));
+    top.appendChild(el('span', 'status', readable(n.status)));
+    a.appendChild(top);
+    if (n.subtask) a.appendChild(el('div', 'work', n.subtask));
+    else if (n.result && n.result.understanding && n.result.understanding.deliverable)
+      a.appendChild(el('div', 'work', n.result.understanding.deliverable));
+    const bar = el('div', 'bar'); bar.appendChild(el('i')); a.appendChild(bar);
+    wrap.appendChild(a);
+  });
+
+  const activeDomains = new Set(nodes.filter(n => n.status === 'running')
+    .map(n => n.agent_id.split('.')[0]));
+  document.querySelectorAll('#rail li').forEach(li => {
+    li.className = done === nodes.length && nodes.length ? 'past' : '';
+  });
+
+  if (['completed','failed','dead','expired','cancelled'].includes(t.status)) {
+    clearInterval(TIMER);
+    if (ES) { ES.close(); ES = null; }
+    $('#runHead').textContent = $('#runHead').textContent.replace(/^/, '');
+  } else { setTimeout(poll, 2000); }
+}
+function readable(s) {
+  return ({pending:'waiting', running:'working', completed:'done', approved:'approved',
+           awaiting_approval:'needs your approval', failed:'failed', skipped:'skipped'})[s] || s;
+}
+
+$('#btnApprove').onclick = async () => {
+  try { await api('POST', '/v1/tasks/' + TASK + '/approve', {}); poll(); }
+  catch (e) { alert(e.message); }
+};
+$('#btnCancel').onclick = async () => {
+  try { await api('POST', '/v1/tasks/' + TASK + '/cancel', {}); poll(); }
+  catch (e) { alert(e.message); }
+};
+
+/* ---------------- vitals ---------------- */
+async function refreshLimits() {
+  let d; try { d = await api('GET', '/v1/providers/limits'); } catch { return; }
+  const live = d.live || {}, box = $('#limits');
+  const keys = Object.keys(live);
+  if (!keys.length) return;
+  box.textContent = '';
+  keys.forEach(p => {
+    const g = live[p];
+    const reqPct = g.rpm_limit ? 0 : 0;
+    const used = g.requests_used_60s || 0;
+    const cap = (g.configured && g.configured.rpm) || 0;
+    const pct = cap ? Math.min(100, used / cap * 100) : 0;
+    const s = el('div');
+    const row = el('div', 'stat');
+    row.appendChild(el('span', '', p));
+    row.appendChild(el('b', '', cap ? Math.round(used) + ' / ' + cap + ' per min' : 'no limit set'));
+    s.appendChild(row);
+    const m = el('div', 'meter'); const i = el('i');
+    i.style.width = pct + '%';
+    if (pct > 85) i.className = 'over'; else if (pct > 60) i.className = 'hot';
+    m.appendChild(i); s.appendChild(m);
+    if (g.effective_scale < 1) {
+      s.appendChild(el('div', 'faint small',
+        'throttled to ' + Math.round(g.effective_scale * 100) + '% after a rate limit'));
+    }
+    box.appendChild(s);
+  });
+}
+
+/* ---------------- agent search ---------------- */
+let qt;
+$('#qAgent').addEventListener('input', e => {
+  clearTimeout(qt);
+  qt = setTimeout(async () => {
+    const q = e.target.value.trim();
+    const list = $('#agentList'); list.textContent = '';
+    if (!q) return;
+    try {
+      const hits = await api('GET', '/v1/agents?q=' + encodeURIComponent(q));
+      if (!hits.length) { list.appendChild(el('div', 'empty', 'Nothing matched.')); return; }
+      hits.slice(0, 12).forEach(h => {
+        const d = el('div', 'hit');
+        d.appendChild(el('span', '', h.name));
+        d.appendChild(el('span', 'id', h.id));
+        list.appendChild(d);
+      });
+    } catch {}
+  }, 220);
+});
+
+boot();
+</script>
+</body>
+</html>
