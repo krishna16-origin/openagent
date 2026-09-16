@@ -378,7 +378,7 @@
       "use strict";
 
       const demoMode = new URLSearchParams(window.location.search).has("demo");
-      const API_BASE = window.MAXIMUS_API_BASE || "";
+      const API_BASE = window.MAXIMUS_API_BASE || "https://openagent-6td5.onrender.com";
       const state = {
         token: localStorage.getItem("maximus_access_token") || "",
         user: null,
