@@ -377,8 +377,11 @@
     (() => {
       "use strict";
 
+      const queryApiBase = new URLSearchParams(window.location.search).get("api");
+      const isLocal = window.location.protocol === "file:" || ["localhost", "127.0.0.1"].includes(window.location.hostname);
+      const defaultApiBase = isLocal ? "http://127.0.0.1:8000" : "https://openagent-6td5.onrender.com";
+      const API_BASE = (window.MAXIMUS_API_BASE || queryApiBase || defaultApiBase).replace(/\/+$/, "");
       const demoMode = new URLSearchParams(window.location.search).has("demo");
-      const API_BASE = window.MAXIMUS_API_BASE || "";
       const state = {
         token: localStorage.getItem("maximus_access_token") || "",
         user: null,
