@@ -192,14 +192,17 @@ Copy `.env.example` to `.env`. Everything has a working default; the only thing 
 real model output is a gateway:
 
 ```
+# local only; on Render, render.yaml wires this to the gateway service automatically
 OMNIROUTE_BASE_URL=http://127.0.0.1:9000
 OMNIROUTE_API_KEY=
 ```
 
 Expected gateway shape: `GET /models`, `POST /v1/chat/completions`, optional `GET /health`.
-`mock_gateway.py` implements it for testing. Without a gateway the pipeline still runs
-end-to-end using deterministic offline output, so you can verify orchestration before spending
-anything.
+`mock_gateway.py` implements it for testing. The Render blueprint runs the real gateway as a
+private service and wires its `host:port` into the backend; the backend also accepts a provider
+key from the environment (`GATEWAY_PROVIDER` + `GATEWAY_API_KEY`, or e.g. `OPENAI_API_KEY`) for
+single-service deployments. Without a configured provider, the pipeline still runs end-to-end
+using deterministic offline output, but conversational replies require a reachable model.
 
 ## Tests
 

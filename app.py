@@ -81,6 +81,18 @@ def _env(key: str, default: str = "") -> str:
     return os.getenv(key, default)
 
 
+# Render provides a private host/port for service-to-service traffic.  The old
+# default pointed at localhost, which is only correct when app.py and the
+# gateway are running in the same local machine/process namespace.
+_ON_RENDER = bool(_env("RENDER") or _env("PORT"))
+_RENDER_GATEWAY_HOST = _env("OMNIROUTE_RENDER_HOST", "openagent-gateway")
+_RENDER_GATEWAY_PORT = _env("OMNIROUTE_RENDER_PORT", "10000")
+_DEFAULT_OMNIROUTE_BASE_URL = (
+    f"http://{_RENDER_GATEWAY_HOST}:{_RENDER_GATEWAY_PORT}" if _ON_RENDER
+    else "http://127.0.0.1:9000"
+)
+
+
 class S:
     APP_NAME = _env("APP_NAME", "MaximusAI")
     SECRET_KEY = _env("SECRET_KEY", "dev-only-change-me-min-32-chars-1234567890")
@@ -90,7 +102,12 @@ class S:
     DATABASE_URL = _env("DATABASE_URL", f"sqlite+aiosqlite:///{(BASE_DIR / 'data' / 'maximus.db').as_posix()}")
     DATA_DIR = _env("DATA_DIR", str(BASE_DIR / "data"))
     SECRETS_MASTER_KEY = _env("SECRETS_MASTER_KEY", "")
-    OMNIROUTE_BASE_URL = _env("OMNIROUTE_BASE_URL", "http://127.0.0.1:9000").rstrip("/")
+    # An explicitly configured URL always wins.  An empty Render variable (the
+    # previous render.yaml value) is treated as unset so it cannot produce a
+    # relative URL or silently fall back to localhost.
+    OMNIROUTE_BASE_URL = (
+        _env("OMNIROUTE_BASE_URL", "").strip() or _DEFAULT_OMNIROUTE_BASE_URL
+    ).rstrip("/")
     OMNIROUTE_API_KEY = _env("OMNIROUTE_API_KEY", "")
     OMNIROUTE_TIMEOUT_S = int(_env("OMNIROUTE_TIMEOUT_S", "60"))
     OMNIROUTE_DEFAULT_CAPABILITY = _env("OMNIROUTE_DEFAULT_CAPABILITY", "reasoning")
@@ -103,7 +120,6 @@ class S:
     # Cloud setup (new): Render (and most PaaS hosts) inject PORT and require the process to
     # listen on 0.0.0.0. If PORT is present — or RENDER is set, which Render always sets — we
     # bind 0.0.0.0 and use that port automatically. API_HOST/API_PORT still win if set explicitly.
-    _ON_RENDER = bool(_env("RENDER") or _env("PORT"))
     API_HOST = _env("API_HOST", "0.0.0.0" if _ON_RENDER else "127.0.0.1")
     API_PORT = int(_env("PORT", _env("API_PORT", "8000")))
 
@@ -2015,30 +2031,53 @@ async def provider_credential(user_id: str, project_id: str = "",
     than the one the user chose. The plaintext secret is kept in memory only for the
     duration of the model call and is never returned to the browser.
     """
-    if not user_id:
-        return None, (provider_override or "")
-    try:
-        SF = session_factory()
-        async with SF() as db:
-            rows = (await db.execute(
-                select(ProviderKey).where(ProviderKey.user_id == user_id,
-                                           ProviderKey.is_valid == True)  # noqa: E712
-            )).scalars().all()
-            rows.sort(key=lambda row: 0 if project_id and row.project_id == project_id else 1)
-            for row in rows:
-                if project_id and row.project_id not in (None, project_id):
-                    continue
-                provider = await db.get(Provider, row.provider_id)
-                slug = provider.slug if provider else ""
-                if provider_override and slug != provider_override:
-                    continue
-                try:
-                    secret = decrypt_secret(row.encrypted_blob)
-                except Exception:
-                    continue
-                return secret, slug
-    except Exception:
-        pass
+    if user_id:
+        try:
+            SF = session_factory()
+            async with SF() as db:
+                rows = (await db.execute(
+                    select(ProviderKey).where(ProviderKey.user_id == user_id,
+                                               ProviderKey.is_valid == True)  # noqa: E712
+                )).scalars().all()
+                rows.sort(key=lambda row: 0 if project_id and row.project_id == project_id else 1)
+                for row in rows:
+                    if project_id and row.project_id not in (None, project_id):
+                        continue
+                    provider = await db.get(Provider, row.provider_id)
+                    slug = provider.slug if provider else ""
+                    if provider_override and slug != provider_override:
+                        continue
+                    try:
+                        secret = decrypt_secret(row.encrypted_blob)
+                    except Exception:
+                        continue
+                    return secret, slug
+        except Exception:
+            pass
+    # A hosted single-service deployment may keep its provider credential in
+    # Render's environment instead of creating a database key first.  This is
+    # deliberately a fallback: database/project-scoped BYOK keys above still
+    # take precedence, and the secret is only returned to the in-process model
+    # call, never to the browser or logs.
+    provider = (provider_override or _env("DEFAULT_PROVIDER", "") or
+                _env("GATEWAY_PROVIDER", "groq")).strip().lower()
+    if provider:
+        env_names = {
+            "openai": ("OPENAI_API_KEY",),
+            "anthropic": ("ANTHROPIC_API_KEY",),
+            "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+            "groq": ("GROQ_API_KEY", "GATEWAY_API_KEY"),
+            "mistral": ("MISTRAL_API_KEY",),
+            "deepseek": ("DEEPSEEK_API_KEY",),
+            "nvidia": ("NVIDIA_API_KEY",),
+            "openrouter": ("OPENROUTER_API_KEY",),
+            "together": ("TOGETHER_API_KEY",),
+            "cohere": ("COHERE_API_KEY",),
+        }.get(provider, (f"{provider.upper()}_API_KEY",))
+        for name in env_names:
+            secret = _env(name, "").strip()
+            if secret:
+                return secret, provider
     return None, (provider_override or "")
 
 
@@ -2302,7 +2341,13 @@ class OmniRouteError(Exception):
 
 class OmniRouteClient:
     def __init__(self, base_url: str | None = None, api_key: str | None = None, timeout_s: int | None = None):
-        self.base = (base_url or S.OMNIROUTE_BASE_URL).rstrip("/")
+        configured_base = (base_url or S.OMNIROUTE_BASE_URL).strip().rstrip("/")
+        # Render Blueprint service references expose `host:port`, not a URL.
+        # Accept both forms so the value can be wired directly with
+        # `fromService.property: hostport`.
+        if configured_base and not re.match(r"^https?://", configured_base, re.I):
+            configured_base = f"http://{configured_base}"
+        self.base = configured_base
         self.api_key = S.OMNIROUTE_API_KEY if api_key is None else api_key
         self.timeout = timeout_s or S.OMNIROUTE_TIMEOUT_S
         self._failures: dict[str, int] = {}

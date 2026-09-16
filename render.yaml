@@ -8,11 +8,8 @@
 #   3. On the gateway service's Environment tab, set GATEWAY_PROVIDER (e.g. "groq") and
 #      GATEWAY_API_KEY (your real provider key) — Render will prompt for these since
 #      they're marked sync: false below.
-#   4. Copy the gateway's URL (Render shows it on the service page, e.g.
-#      https://openagent-gateway.onrender.com) and paste it as OMNIROUTE_BASE_URL on the
-#      openagent-backend service, then trigger a deploy on openagent-backend.
-#      (This one step is manual: Render can auto-wire a shared secret between services,
-#      but not a full "https://<host>" URL into a plain env var.)
+#   4. Deploy. Render wires the backend to the gateway over its private host:port;
+#      no localhost URL or manual copy/paste is required.
 #   5. Copy the backend's own URL into Settings -> Backend URL in the frontend, or open
 #      it with ?api=https://<backend>.onrender.com once.
 #
@@ -42,29 +39,30 @@ services:
         generateValue: true
       - key: SECRETS_MASTER_KEY
         generateValue: true
-      # Step 4 above: paste the gateway's URL here once you have it, e.g.
-      # https://openagent-gateway.onrender.com (no trailing slash).
+      # Render supplies the gateway's private host:port automatically.
       - key: OMNIROUTE_BASE_URL
-        value: ""
+        fromService:
+          name: openagent-gateway
+          type: pserv
+          property: hostport
       # Auto-wired to match GATEWAY_AUTH_TOKEN on the gateway service below, so the two
       # authenticate to each other without you copying a secret by hand.
       - key: OMNIROUTE_API_KEY
         fromService:
           name: openagent-gateway
-          type: web
+          type: pserv
           envVarKey: GATEWAY_AUTH_TOKEN
       # Render's default disk is ephemeral: the SQLite file resets on every deploy/restart.
       # That's fine for testing. For anything persistent, add a Render PostgreSQL instance
       # and set DATABASE_URL here to postgresql+asyncpg://... (see README "Scaling up").
 
-  - type: web
+  - type: pserv
     name: openagent-gateway
     runtime: python
     plan: free
     branch: main
     buildCommand: "true"          # stdlib only — nothing to install
     startCommand: python omniroute_gateway.py
-    healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
@@ -78,4 +76,8 @@ services:
       # Shared secret so only openagent-backend can use this gateway.
       - key: GATEWAY_AUTH_TOKEN
         generateValue: true
+      # Keep the private service address deterministic for the backend's
+      # hostport reference. Render may still provide PORT at runtime.
+      - key: GATEWAY_PORT
+        value: "10000"
 
