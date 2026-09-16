@@ -1,0 +1,81 @@
+# Render deployment blueprint for openagent: the Maximus backend (app.py) plus the
+# real-provider gateway it talks to (omniroute_gateway.py).
+# Docs: https://render.com/docs/blueprint-spec
+#
+# Usage:
+#   1. Push this repo to GitHub/GitLab.
+#   2. In Render: New -> Blueprint -> pick this repo. This deploys BOTH services below.
+#   3. On the gateway service's Environment tab, set GATEWAY_PROVIDER (e.g. "groq") and
+#      GATEWAY_API_KEY (your real provider key) — Render will prompt for these since
+#      they're marked sync: false below.
+#   4. Copy the gateway's URL (Render shows it on the service page, e.g.
+#      https://openagent-gateway.onrender.com) and paste it as OMNIROUTE_BASE_URL on the
+#      openagent-backend service, then trigger a deploy on openagent-backend.
+#      (This one step is manual: Render can auto-wire a shared secret between services,
+#      but not a full "https://<host>" URL into a plain env var.)
+#   5. Copy the backend's own URL into Settings -> Backend URL in the frontend, or open
+#      it with ?api=https://<backend>.onrender.com once.
+#
+# This does not affect the local setup at all: `python app.py` (and, for real replies,
+# `python omniroute_gateway.py`) still run exactly as before, with the same defaults,
+# whether or not this file exists.
+
+services:
+  - type: web
+    name: openagent-backend
+    runtime: python
+    plan: free
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      # Restrict this to your actual frontend origin once you have one, e.g.
+      # https://your-frontend.onrender.com — "*" is fine for quick testing.
+      - key: CORS_ORIGINS
+        value: "*"
+      # Auto-generated so JWTs and encrypted provider keys aren't signed with the
+      # repo's dev-only fallback secret once this is running in the cloud.
+      - key: SECRET_KEY
+        generateValue: true
+      - key: SECRETS_MASTER_KEY
+        generateValue: true
+      # Step 4 above: paste the gateway's URL here once you have it, e.g.
+      # https://openagent-gateway.onrender.com (no trailing slash).
+      - key: OMNIROUTE_BASE_URL
+        value: ""
+      # Auto-wired to match GATEWAY_AUTH_TOKEN on the gateway service below, so the two
+      # authenticate to each other without you copying a secret by hand.
+      - key: OMNIROUTE_API_KEY
+        fromService:
+          name: openagent-gateway
+          type: web
+          envVarKey: GATEWAY_AUTH_TOKEN
+      # Render's default disk is ephemeral: the SQLite file resets on every deploy/restart.
+      # That's fine for testing. For anything persistent, add a Render PostgreSQL instance
+      # and set DATABASE_URL here to postgresql+asyncpg://... (see README "Scaling up").
+
+  - type: web
+    name: openagent-gateway
+    runtime: python
+    plan: free
+    branch: main
+    buildCommand: "true"          # stdlib only — nothing to install
+    startCommand: python omniroute_gateway.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      # Set these two in the Render dashboard after the blueprint creates the service —
+      # sync: false means Render prompts for them rather than storing them in this file.
+      - key: GATEWAY_PROVIDER   # openai | anthropic | groq | openai_compatible
+        value: groq
+        sync: false
+      - key: GATEWAY_API_KEY    # your real provider API key
+        sync: false
+      # Shared secret so only openagent-backend can use this gateway.
+      - key: GATEWAY_AUTH_TOKEN
+        generateValue: true
+
