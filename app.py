@@ -99,8 +99,13 @@ class S:
     MAX_COST_USD_PER_TASK = float(_env("MAX_COST_USD_PER_TASK", "5.0"))
     MAX_RETRIES = int(_env("MAX_RETRIES", "3"))
     RATE_LIMIT_PER_MIN = int(_env("RATE_LIMIT_PER_MIN", "60"))
-    API_HOST = _env("API_HOST", "127.0.0.1")
-    API_PORT = int(_env("API_PORT", "8000"))
+    # Local setup (unchanged): `python app.py` with no env vars still binds 127.0.0.1:8000.
+    # Cloud setup (new): Render (and most PaaS hosts) inject PORT and require the process to
+    # listen on 0.0.0.0. If PORT is present — or RENDER is set, which Render always sets — we
+    # bind 0.0.0.0 and use that port automatically. API_HOST/API_PORT still win if set explicitly.
+    _ON_RENDER = bool(_env("RENDER") or _env("PORT"))
+    API_HOST = _env("API_HOST", "0.0.0.0" if _ON_RENDER else "127.0.0.1")
+    API_PORT = int(_env("PORT", _env("API_PORT", "8000")))
 
 
 def data_dir() -> Path:
@@ -4308,7 +4313,13 @@ def create_app() -> FastAPI:
                        allow_origins=_env("CORS_ORIGINS", "*").split(","),
                        allow_methods=["*"], allow_headers=["*"])
 
+    # Original lookup (unchanged): an index.html dropped next to app.py wins if present.
+    # Added: fall back to the frontend/index.html that ships in this repo, so `python app.py`
+    # serves the UI without an extra manual copy step, and so a single Render web service can
+    # serve both the API and the UI together if that's how it's deployed.
     index = BASE_DIR / "index.html"
+    if not index.exists() and (BASE_DIR / "frontend" / "index.html").exists():
+        index = BASE_DIR / "frontend" / "index.html"
 
     @app.get("/", include_in_schema=False)
     async def root(request: Request):
