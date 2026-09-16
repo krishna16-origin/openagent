@@ -2106,9 +2106,20 @@ async def fast_reply(message: str, history: list[dict] | None = None,
         tokens = int(usage.get("total_tokens") or len(text) // 4)
         cached = bool(resp.get("_cached"))
         model_used = resp.get("model") or model_used
-    except Exception as e:
-        text = (f"I could not reach a model gateway, so I cannot answer conversationally "
-                f"right now. ({redact(str(e))[:300]})")
+    except ModelUnavailableError:
+        text = "The selected model is not available. Please choose another model."
+        tokens, cached = 0, False
+    except OmniRouteError as e:
+        # Keep provider/network details out of the conversation. A working model
+        # should produce an answer; if the provider is temporarily unavailable,
+        # give the user a concise retry message instead of exposing internals.
+        if _looks_like_model_error(str(e)):
+            text = "The selected model is not available. Please choose another model."
+        else:
+            text = "I couldn't generate a response right now. Please try again."
+        tokens, cached = 0, False
+    except Exception:
+        text = "I couldn't generate a response right now. Please try again."
         tokens, cached = 0, False
     return {"reply": text, "tokens": tokens, "cached": cached, "model": model_used,
             "latency_ms": int((time.monotonic() - t0) * 1000)}
@@ -2339,6 +2350,11 @@ class OmniRouteError(Exception):
     pass
 
 
+class ModelUnavailableError(OmniRouteError):
+    """The model explicitly selected by the user cannot be used anymore."""
+    pass
+
+
 class OmniRouteClient:
     def __init__(self, base_url: str | None = None, api_key: str | None = None, timeout_s: int | None = None):
         configured_base = (base_url or S.OMNIROUTE_BASE_URL).strip().rstrip("/")
@@ -2418,6 +2434,12 @@ class OmniRouteClient:
         # here starts automatically. No key -> unchanged gateway path below.
         if provider_key and provider:
             t0 = time.monotonic()
+            explicit_model = bool(model_hint)
+            model = model_hint or ""
+            if explicit_model and is_deprecated_provider_model(provider, model_hint):
+                raise ModelUnavailableError(
+                    f"model '{model_hint}' is no longer available"
+                )
             try:
                 model = model_hint or await resolve_model_for_provider(provider, provider_key, capability)
                 if not model:
@@ -2431,7 +2453,34 @@ class OmniRouteClient:
                 data["model"] = model
                 RESPONSE_CACHE.put(messages, capability, max_tokens, cache_key_extra, data)
                 return data
-            except OmniRouteError:
+            except OmniRouteError as e:
+                if _looks_like_model_error(str(e)):
+                    if explicit_model:
+                        raise ModelUnavailableError(
+                            f"model '{model_hint}' is not available"
+                        ) from e
+                    # Cached catalogues can contain models removed by the
+                    # provider. Refresh once and retry with a live model.
+                    try:
+                        fresh_model = await resolve_live_model_for_provider(
+                            provider, provider_key, capability, exclude={model}
+                        )
+                    except Exception:
+                        fresh_model = None
+                    if fresh_model and fresh_model != model:
+                        try:
+                            data = await direct_provider_complete(
+                                provider, provider_key, messages, fresh_model,
+                                temperature=temperature, max_tokens=max_tokens,
+                                timeout_s=timeout_s or self.timeout,
+                            )
+                            data["_latency_ms"] = int((time.monotonic() - t0) * 1000)
+                            data["_cost_usd"] = data.get("_cost_usd", 0.0)
+                            data["model"] = fresh_model
+                            RESPONSE_CACHE.put(messages, capability, max_tokens, cache_key_extra, data)
+                            return data
+                        except OmniRouteError:
+                            pass
                 raise
             except Exception as e:
                 raise OmniRouteError(f"direct provider call failed: {redact(str(e))[:200]}")
@@ -2461,7 +2510,7 @@ class OmniRouteClient:
                     if r.status_code >= 500:
                         gate.on_error()
                         raise OmniRouteError(f"gateway {r.status_code}")
-                    r.raise_for_status()
+                    _raise_gateway_error(r)
                     data = r.json()
                     actual = int((data.get("usage") or {}).get("total_tokens") or est)
                     await gate.settle(est, actual)
@@ -2493,6 +2542,21 @@ def _retry_after(r) -> float | None:
         except Exception:
             continue
     return None
+
+
+def _raise_gateway_error(r: "httpx.Response") -> None:
+    if r.status_code < 400:
+        return
+    try:
+        body = r.json()
+        error = body.get("error") if isinstance(body, dict) else None
+        detail = error.get("message") if isinstance(error, dict) else None
+        detail = detail or (str(body)[:400] if body else "")
+    except Exception:
+        detail = (r.text or "")[:400]
+    raise OmniRouteError(
+        f"gateway returned HTTP {r.status_code}: {redact(detail) or '(no detail)'}"
+    )
 
 
 class ResponseCache:
@@ -2573,6 +2637,18 @@ PROVIDER_MODEL_ALIASES: dict[str, dict[str, str]] = {
         "llama-3.3-70b-versatile": "openai/gpt-oss-120b",
     },
 }
+
+
+def is_deprecated_provider_model(provider: str, model: str | None) -> bool:
+    return bool(model and model in PROVIDER_MODEL_ALIASES.get((provider or "").lower(), {}))
+
+
+def _looks_like_model_error(message: str) -> bool:
+    value = (message or "").lower()
+    return "model" in value and any(word in value for word in (
+        "not found", "not available", "deprecated", "decommission", "does not exist",
+        "unsupported", "invalid",
+    ))
 
 
 def normalize_provider_model(provider: str, model: str) -> str:
@@ -2884,7 +2960,33 @@ async def resolve_model_for_provider(provider: str, api_key: str, capability: st
         if disc.get("ok"):
             models = disc.get("models") or []
     picked = pick_model(models, capability)
-    return normalize_provider_model(provider, picked["model_id"]) if picked else None
+    if picked and not is_deprecated_provider_model(provider, picked["model_id"]):
+        return picked["model_id"]
+
+    # A persisted catalogue can outlive a provider's model. Refresh only when
+    # the cached choice is retired, so normal requests do not pay a discovery
+    # round trip while stale deployments recover automatically.
+    disc = await discover_models_for_key(provider, api_key)
+    if not disc.get("ok"):
+        return normalize_provider_model(provider, picked["model_id"]) if picked else None
+    live_models = [m for m in (disc.get("models") or [])
+                   if not is_deprecated_provider_model(provider, m.get("model_id"))]
+    picked = pick_model(live_models, capability)
+    return picked["model_id"] if picked else None
+
+
+async def resolve_live_model_for_provider(provider: str, api_key: str, capability: str,
+                                          exclude: set[str] | None = None) -> str | None:
+    """Select a current provider model after a cached model was rejected."""
+    disc = await discover_models_for_key(provider, api_key)
+    if not disc.get("ok"):
+        return None
+    excluded = exclude or set()
+    live_models = [m for m in (disc.get("models") or [])
+                   if m.get("model_id") not in excluded
+                   and not is_deprecated_provider_model(provider, m.get("model_id"))]
+    picked = pick_model(live_models, capability)
+    return picked["model_id"] if picked else None
 
 
 async def persist_models(db: AsyncSession, provider_slug: str, models: list[dict]) -> int:

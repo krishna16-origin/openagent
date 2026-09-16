@@ -227,6 +227,8 @@ def complete(capability: str, model_hint: str | None, messages: list[dict],
     active_key = (api_key or API_KEY).strip()
     if not active_key:
         raise UpstreamError(401, "no provider API key configured")
+    if model_hint in _MODEL_ALIASES:
+        raise UpstreamError(400, f"model '{model_hint}' is no longer available")
     model = _normalize_model(model_hint or MODEL_MAP.get(capability) or DEFAULT_MODEL)
     if not model:
         raise UpstreamError(400, f"no model configured for capability={capability!r}")
