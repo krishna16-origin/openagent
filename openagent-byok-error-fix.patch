@@ -1,0 +1,98 @@
+diff --git a/app.py b/app.py
+index d5c1271..7fe1d3a 100644
+--- a/app.py
++++ b/app.py
+@@ -2069,7 +2069,7 @@ async def fast_reply(message: str, history: list[dict] | None = None,
+         model_used = resp.get("model") or model_used
+     except Exception as e:
+         text = (f"I could not reach a model gateway, so I cannot answer conversationally "
+-                f"right now. ({redact(str(e))[:120]})")
++                f"right now. ({redact(str(e))[:220]})")
+         tokens, cached = 0, False
+     return {"reply": text, "tokens": tokens, "cached": cached, "model": model_used,
+             "latency_ms": int((time.monotonic() - t0) * 1000)}
+@@ -2385,8 +2385,10 @@ class OmniRouteClient:
+                 data["model"] = model
+                 RESPONSE_CACHE.put(messages, capability, max_tokens, cache_key_extra, data)
+                 return data
++            except OmniRouteError:
++                raise
+             except Exception as e:
+-                raise OmniRouteError(f"direct provider call failed: {redact(str(e))[:200]}")
++                raise OmniRouteError(f"direct provider call failed: {redact(str(e))[:300]}")
+ 
+         gate = gate_for(provider or _env("DEFAULT_PROVIDER", "_default"))
+         est = estimate_tokens(messages, max_tokens)
+@@ -2568,6 +2570,8 @@ PROVIDER_DISCOVERY: dict[str, dict] = {
+ CAPABILITY_HINTS: tuple[tuple[str, str], ...] = (
+     ("embed", "embedding"), ("rerank", "rerank"), ("whisper", "audio"), ("tts", "audio"),
+     ("dall-e", "image"), ("imagen", "image"), ("flux", "image"), ("stable-diffusion", "image"),
++    ("prompt-guard", "moderation"), ("promptguard", "moderation"),
++    ("llama-guard", "moderation"), ("guard-4", "moderation"), ("safeguard", "moderation"),
+     ("coder", "code"), ("code", "code"), ("devstral", "code"), ("codestral", "code"),
+     ("vision", "vision"), ("-vl", "vision"), ("pixtral", "vision"), ("llava", "vision"),
+     ("reasoner", "reasoning"), ("thinking", "reasoning"), ("-r1", "reasoning"),
+@@ -2587,8 +2591,8 @@ def infer_capabilities(model_id: str, context_window: int = 0) -> list[str]:
+             tags.append(tag)
+     if not tags:
+         tags = ["general"]
+-    if tags[0] in ("embedding", "rerank", "audio", "image"):
+-        return tags                       # not a chat model, no general tag
++    if tags[0] in ("embedding", "rerank", "audio", "image", "moderation"):
++        return tags                       # not a general chat model, no general tag
+     if "general" not in tags:
+         tags.append("general")
+     if context_window >= 200000 and "long-context" not in tags:
+@@ -2701,6 +2705,25 @@ async def discover_models_for_key(provider: str, api_key: str, base_url: str = "
+ _OPENAI_SHAPED = ("openai", "groq", "mistral", "deepseek", "nvidia", "openrouter", "together")
+ 
+ 
++def _raise_provider_error(r: "httpx.Response") -> None:
++    """httpx's default raise_for_status() message is just the status line
++    ("Client error '400 Bad Request' for url '...'") -- it never includes the
++    provider's own response body, which is where the actual reason lives
++    (invalid/decommissioned model, malformed request, bad key, etc). Pull that
++    body out so callers -- and the person reading the chat error -- see why the
++    call actually failed, not just that it failed.
++    """
++    if r.status_code < 400:
++        return
++    try:
++        body = r.json()
++        detail = (body.get("error") or {}).get("message") if isinstance(body, dict) else None
++        detail = detail or (str(body)[:300] if body else "")
++    except Exception:
++        detail = (r.text or "")[:300]
++    raise OmniRouteError(f"provider returned HTTP {r.status_code}: {redact(detail) or '(no detail)'}")
++
++
+ async def direct_provider_complete(provider: str, api_key: str, messages: list[dict], model: str,
+                                    temperature: float = 0.2, max_tokens: int = 2000,
+                                    timeout_s: float = 30.0) -> dict:
+@@ -2731,7 +2754,7 @@ async def direct_provider_complete(provider: str, api_key: str, messages: list[d
+         if system:
+             payload["system"] = system
+         r = await http().post(url, headers=headers, json=payload, timeout=timeout_s)
+-        r.raise_for_status()
++        _raise_provider_error(r)
+         data = r.json()
+         text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+         usage = data.get("usage") or {}
+@@ -2751,7 +2774,7 @@ async def direct_provider_complete(provider: str, api_key: str, messages: list[d
+         if system:
+             payload["systemInstruction"] = {"parts": [{"text": system}]}
+         r = await http().post(url, params={"key": api_key}, json=payload, timeout=timeout_s)
+-        r.raise_for_status()
++        _raise_provider_error(r)
+         data = r.json()
+         candidates = data.get("candidates") or [{}]
+         parts = (candidates[0].get("content") or {}).get("parts") or []
+@@ -2770,7 +2793,7 @@ async def direct_provider_complete(provider: str, api_key: str, messages: list[d
+         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+         payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+         r = await http().post(url, headers=headers, json=payload, timeout=timeout_s)
+-        r.raise_for_status()
++        _raise_provider_error(r)
+         return r.json()
+ 
+     raise OmniRouteError(f"no direct chat-completions support for provider '{provider}'")
