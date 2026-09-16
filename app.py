@@ -1083,6 +1083,8 @@ class ChatIn(BaseModel):
     history: list[dict] = []
     project_id: str
     message: str
+    model: str | None = None                 # explicit model id from the UI's model picker
+    provider: str | None = None              # provider slug that model belongs to, e.g. "openai"
 
 
 class MemoryStore(BaseModel):
@@ -2003,14 +2005,18 @@ FAST_SYSTEM = (
 )
 
 
-async def provider_credential(user_id: str, project_id: str = "") -> tuple[str | None, str]:
+async def provider_credential(user_id: str, project_id: str = "",
+                              provider_override: str | None = None) -> tuple[str | None, str]:
     """Return the user's project-scoped BYOK secret and provider slug.
 
-    Project keys win over user-wide keys. The plaintext secret is kept in memory only
-    for the duration of the model call and is never returned to the browser.
+    Project keys win over user-wide keys. When `provider_override` is set (the user
+    picked a specific model in the UI), only a key for that exact provider is
+    considered, so a selection is never silently answered by a different provider
+    than the one the user chose. The plaintext secret is kept in memory only for the
+    duration of the model call and is never returned to the browser.
     """
     if not user_id:
-        return None, ""
+        return None, (provider_override or "")
     try:
         SF = session_factory()
         async with SF() as db:
@@ -2022,38 +2028,50 @@ async def provider_credential(user_id: str, project_id: str = "") -> tuple[str |
             for row in rows:
                 if project_id and row.project_id not in (None, project_id):
                     continue
+                provider = await db.get(Provider, row.provider_id)
+                slug = provider.slug if provider else ""
+                if provider_override and slug != provider_override:
+                    continue
                 try:
                     secret = decrypt_secret(row.encrypted_blob)
                 except Exception:
                     continue
-                provider = await db.get(Provider, row.provider_id)
-                return secret, provider.slug if provider else ""
+                return secret, slug
     except Exception:
         pass
-    return None, ""
+    return None, (provider_override or "")
 
 
 async def fast_reply(message: str, history: list[dict] | None = None,
-                     project_id: str = "", user_id: str = "") -> dict:
-    """Single-call conversational response. No planning, no DAG, no agents."""
+                     project_id: str = "", user_id: str = "",
+                     model: str | None = None, provider: str | None = None) -> dict:
+    """Single-call conversational response. No planning, no DAG, no agents.
+
+    `model`/`provider` come straight from the UI's model picker. When set, they are
+    forced through as an explicit model_hint (and a provider-scoped key lookup)
+    instead of letting the capability router pick something else.
+    """
     t0 = time.monotonic()
     omni = OmniRouteClient()
     messages = build_messages(FAST_SYSTEM, message, history)
-    provider_key, provider_slug = await provider_credential(user_id, project_id)
+    provider_key, provider_slug = await provider_credential(user_id, project_id, provider)
+    model_used = model or ""
     try:
         resp = await omni.complete(messages, capability="cheap", max_tokens=700,
+                                   model_hint=model or None,
                                    timeout_s=int(_env("CHAT_TIMEOUT_S", "20")),
                                    provider_key=provider_key, provider=provider_slug,
-                                   cache_key_extra=f"fastchat:{provider_slug or 'gateway'}")
+                                   cache_key_extra=f"fastchat:{provider_slug or 'gateway'}:{model or 'auto'}")
         text = (resp.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
         usage = resp.get("usage") or {}
         tokens = int(usage.get("total_tokens") or len(text) // 4)
         cached = bool(resp.get("_cached"))
+        model_used = resp.get("model") or model_used
     except Exception as e:
         text = (f"I could not reach a model gateway, so I cannot answer conversationally "
                 f"right now. ({redact(str(e))[:120]})")
         tokens, cached = 0, False
-    return {"reply": text, "tokens": tokens, "cached": cached,
+    return {"reply": text, "tokens": tokens, "cached": cached, "model": model_used,
             "latency_ms": int((time.monotonic() - t0) * 1000)}
 
 
@@ -4200,8 +4218,15 @@ async def list_models():
     SF = session_factory()
     async with SF() as db:
         rows = (await db.execute(select(Model).limit(200))).scalars().all()
-        return [{"provider": r.provider_id, "model": r.model_id, "tags": r.capability_tags,
-                 "tier": r.tier, "enabled": r.enabled} for r in rows]
+        out = []
+        for r in rows:
+            prov = await db.get(Provider, r.provider_id)
+            # `provider` must be the human-readable slug ("openai", "groq", ...), not the
+            # internal provider row id, since the client sends it straight back on /v1/chat
+            # to pick which stored key to use for a selected model.
+            out.append({"provider": prov.slug if prov else r.provider_id, "model": r.model_id,
+                       "tags": r.capability_tags, "tier": r.tier, "enabled": r.enabled})
+        return out
 
 
 @models_r.post("/discover")
@@ -4301,12 +4326,12 @@ async def chat(body: ChatIn, user: User = Depends(current_user)):
     if intent["mode"] == "chat":
         await quota_for(user.id).acquire(estimate_tokens(body.message, 700))
         hist = body.history or []
-        res = await fast_reply(body.message, hist, body.project_id, user.id)
+        res = await fast_reply(body.message, hist, body.project_id, user.id, body.model, body.provider)
         await _audit(user.id, "chat.fast", body.project_id, "ok",
-                     {"latency_ms": res["latency_ms"], "cached": res["cached"]})
+                     {"latency_ms": res["latency_ms"], "cached": res["cached"], "model": res.get("model")})
         return {"mode": "chat", "intent": intent, "reply": res["reply"],
                 "latency_ms": res["latency_ms"], "cached": res["cached"],
-                "tokens": res["tokens"], "task_id": None}
+                "tokens": res["tokens"], "task_id": None, "model": res.get("model")}
 
     # real work -> hand to the orchestrator, return immediately, stream the rest
     async with SF() as db:
