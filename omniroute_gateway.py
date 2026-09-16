@@ -162,8 +162,8 @@ def _post_json(url: str, headers: dict, payload: dict, timeout_s: float) -> dict
 # --------------------------------------------------------------------------------------
 
 def _call_openai_compatible(model: str, messages: list[dict], temperature: float,
-                             max_tokens: int, timeout_s: float) -> dict:
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
+                             max_tokens: int, timeout_s: float, api_key: str) -> dict:
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
     payload = {"model": model, "messages": messages, "temperature": temperature,
                "max_tokens": max_tokens}
     data = _post_json(f"{BASE_URL}/chat/completions", headers, payload, timeout_s)
@@ -174,12 +174,12 @@ def _call_openai_compatible(model: str, messages: list[dict], temperature: float
 
 
 def _call_anthropic(model: str, messages: list[dict], temperature: float,
-                     max_tokens: int, timeout_s: float) -> dict:
+                    max_tokens: int, timeout_s: float, api_key: str) -> dict:
     system_parts = [m.get("content", "") for m in messages if m.get("role") == "system"]
     convo = [m for m in messages if m.get("role") in ("user", "assistant")]
     headers = {
         "Content-Type": "application/json",
-        "x-api-key": API_KEY,
+        "x-api-key": api_key,
         "anthropic-version": "2023-06-01",
     }
     payload = {
@@ -209,13 +209,19 @@ def _call_anthropic(model: str, messages: list[dict], temperature: float,
 
 
 def complete(capability: str, model_hint: str | None, messages: list[dict],
-             temperature: float, max_tokens: int, timeout_s: float) -> dict:
+             temperature: float, max_tokens: int, timeout_s: float,
+             api_key: str | None = None, provider_slug: str = "") -> dict:
+    # The main app may provide a user-scoped BYOK key through X-Provider-Key.
+    # The gateway still controls provider/model selection via its deployment config.
+    active_key = (api_key or API_KEY).strip()
+    if not active_key:
+        raise UpstreamError(401, "no provider API key configured")
     model = model_hint or MODEL_MAP.get(capability) or DEFAULT_MODEL
     if not model:
         raise UpstreamError(400, f"no model configured for capability={capability!r}")
     if _cfg["kind"] == "anthropic":
-        return _call_anthropic(model, messages, temperature, max_tokens, timeout_s)
-    return _call_openai_compatible(model, messages, temperature, max_tokens, timeout_s)
+        return _call_anthropic(model, messages, temperature, max_tokens, timeout_s, active_key)
+    return _call_openai_compatible(model, messages, temperature, max_tokens, timeout_s, active_key)
 
 
 # --------------------------------------------------------------------------------------
@@ -272,10 +278,13 @@ class Handler(BaseHTTPRequestHandler):
         model_hint = body.get("model") or None
         temperature = float(body.get("temperature", 0.2))
         max_tokens = int(body.get("max_tokens", 700))
+        provider_key = self.headers.get("X-Provider-Key", "").strip() or API_KEY
+        provider_slug = self.headers.get("X-Provider-Slug", "").strip()
 
         t0 = time.monotonic()
         try:
-            data = complete(capability, model_hint, messages, temperature, max_tokens, TIMEOUT_S)
+            data = complete(capability, model_hint, messages, temperature, max_tokens, TIMEOUT_S,
+                            api_key=provider_key, provider_slug=provider_slug)
             data["_latency_ms"] = int((time.monotonic() - t0) * 1000)
             self._send(data)
         except UpstreamError as e:

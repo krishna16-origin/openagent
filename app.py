@@ -771,6 +771,10 @@ def get_engine():
         url = S.DATABASE_URL
         if url.startswith("sqlite+aiosqlite://"):
             f = url.split("sqlite+aiosqlite://", 1)[1].split("?")[0]
+            # SQLAlchemy uses /C:/... in Windows SQLite URLs; pathlib needs C:/...
+            # without the leading slash when creating the parent directory.
+            if sys.platform == "win32" and re.match(r"^/[A-Za-z]:[\\\\/]", f):
+                f = f[1:]
             Path(f).parent.mkdir(parents=True, exist_ok=True)
         if url.startswith("sqlite"):
             _engine = create_async_engine(url, echo=False, future=True,
@@ -1432,7 +1436,8 @@ class GenericAgent:
         """One model call. Returns (text, tokens, usd, model)."""
         resp = await deps.omni.complete(messages, capability=cap, max_tokens=max_tokens,
                                         timeout_s=int(_env("AGENT_CALL_TIMEOUT_S", "45")),
-                                        cache_key_extra=f"{self.definition.id}:{label}")
+                                        provider_key=deps.provider_key, provider=deps.provider_slug,
+                                        cache_key_extra=f"{self.definition.id}:{label}:{deps.provider_slug or 'gateway'}")
         text = (resp.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
         usage = resp.get("usage") or {}
         tokens = int(usage.get("total_tokens") or (len(text) // 4) + 1)
@@ -1998,16 +2003,48 @@ FAST_SYSTEM = (
 )
 
 
+async def provider_credential(user_id: str, project_id: str = "") -> tuple[str | None, str]:
+    """Return the user's project-scoped BYOK secret and provider slug.
+
+    Project keys win over user-wide keys. The plaintext secret is kept in memory only
+    for the duration of the model call and is never returned to the browser.
+    """
+    if not user_id:
+        return None, ""
+    try:
+        SF = session_factory()
+        async with SF() as db:
+            rows = (await db.execute(
+                select(ProviderKey).where(ProviderKey.user_id == user_id,
+                                           ProviderKey.is_valid == True)  # noqa: E712
+            )).scalars().all()
+            rows.sort(key=lambda row: 0 if project_id and row.project_id == project_id else 1)
+            for row in rows:
+                if project_id and row.project_id not in (None, project_id):
+                    continue
+                try:
+                    secret = decrypt_secret(row.encrypted_blob)
+                except Exception:
+                    continue
+                provider = await db.get(Provider, row.provider_id)
+                return secret, provider.slug if provider else ""
+    except Exception:
+        pass
+    return None, ""
+
+
 async def fast_reply(message: str, history: list[dict] | None = None,
-                     project_id: str = "") -> dict:
+                     project_id: str = "", user_id: str = "") -> dict:
     """Single-call conversational response. No planning, no DAG, no agents."""
     t0 = time.monotonic()
     omni = OmniRouteClient()
     messages = build_messages(FAST_SYSTEM, message, history)
+    provider_key, provider_slug = await provider_credential(user_id, project_id)
     try:
         resp = await omni.complete(messages, capability="cheap", max_tokens=700,
                                    timeout_s=int(_env("CHAT_TIMEOUT_S", "20")),
-                                   cache_key_extra="fastchat")
+                                   provider_key=provider_key, provider=provider_slug,
+                                   cache_key_extra=f"fastchat:{provider_slug or 'gateway'}")
         text = (resp.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
         usage = resp.get("usage") or {}
         tokens = int(usage.get("total_tokens") or len(text) // 4)
@@ -2135,6 +2172,8 @@ class Deps:
     tools: Any
     memory: Any
     events: Any
+    provider_key: str | None = None
+    provider_slug: str = ""
 
 
 async def _emit_safe(deps: Deps, task_id: str, run_id: str | None, typ: str, payload: dict) -> None:
@@ -2251,12 +2290,14 @@ class OmniRouteClient:
         self._failures: dict[str, int] = {}
         self._opened: dict[str, float] = {}
 
-    def _headers(self, provider_key: str | None = None) -> dict[str, str]:
+    def _headers(self, provider_key: str | None = None, provider_slug: str = "") -> dict[str, str]:
         h = {"Content-Type": "application/json"}
         if self.api_key:
             h["Authorization"] = f"Bearer {self.api_key}"
         if provider_key:
             h["X-Provider-Key"] = provider_key  # BYOK, server-side only, never logged
+        if provider_slug:
+            h["X-Provider-Slug"] = provider_slug
         return h
 
     def _cb_open(self, key: str) -> bool:
@@ -2323,7 +2364,7 @@ class OmniRouteClient:
                         t0 = time.monotonic()
                         r = await http().post(
                             f"{self.base}/v1/chat/completions",
-                            headers=self._headers(provider_key),
+                            headers=self._headers(provider_key, provider),
                             json={"messages": messages, "capability": cap, "model": model_hint,
                                   "temperature": temperature, "max_tokens": max_tokens},
                             timeout=timeout_s or self.timeout)
@@ -3142,7 +3183,10 @@ class ExecResult(dict):
 # No E2B. No Docker. No cloud. Code runs here, in a jailed working directory, with
 # the network cut off and hard resource ceilings. Isolation is layered, and the layers
 # that are actually active are reported honestly via /v1/sandboxes/capabilities.
-import resource
+try:
+    import resource
+except ImportError:  # Windows does not expose POSIX resource limits.
+    resource = None
 import signal
 
 NET_KILL_ENV = {
@@ -3284,6 +3328,8 @@ class ExecLimits:
 
 
 def _apply_rlimits() -> None:  # runs in the child, after fork, before exec
+    if resource is None:
+        return
     try:
         os.setsid()
     except Exception:
@@ -3546,7 +3592,7 @@ async def execute_task(task_id: str) -> None:
             return
         task.status = "running"
         await db.commit()
-        goal, project_id = task.goal, task.project_id
+        goal, project_id, user_id = task.goal, task.project_id, task.user_id
         budget_tokens, budget_usd = task.budget_tokens, task.budget_usd
         dag = dict(task.dag or {})
 
@@ -3565,7 +3611,9 @@ async def execute_task(task_id: str) -> None:
             await emit(task_id, None, "task_created", {"node": st.node_id, "depends_on": st.depends_on})
 
     omni = OmniRouteClient()
-    deps = Deps(omni=omni, tools=TOOLS, memory=MEMORY, events=emit)
+    provider_key, provider_slug = await provider_credential(user_id, project_id)
+    deps = Deps(omni=omni, tools=TOOLS, memory=MEMORY, events=emit,
+                provider_key=provider_key, provider_slug=provider_slug)
     sem = asyncio.Semaphore(dag.get("concurrency", 4) or 4)
     used = {"tokens": 0, "usd": 0.0}
 
@@ -4127,7 +4175,7 @@ async def chat(body: ChatIn, user: User = Depends(current_user)):
     if intent["mode"] == "chat":
         await quota_for(user.id).acquire(estimate_tokens(body.message, 700))
         hist = body.history or []
-        res = await fast_reply(body.message, hist, body.project_id)
+        res = await fast_reply(body.message, hist, body.project_id, user.id)
         await _audit(user.id, "chat.fast", body.project_id, "ok",
                      {"latency_ms": res["latency_ms"], "cached": res["cached"]})
         return {"mode": "chat", "intent": intent, "reply": res["reply"],
