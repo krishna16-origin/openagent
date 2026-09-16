@@ -57,12 +57,12 @@ _PROVIDER_DEFAULTS = {
         "kind": "openai_compatible",
         "base_url": "https://api.groq.com/openai/v1",
         "models": {
-            "cheap": "llama-3.1-8b-instant",
-            "general": "llama-3.3-70b-versatile",
-            "reasoning": "llama-3.3-70b-versatile",
-            "code": "llama-3.3-70b-versatile",
-            "vision": "llama-3.3-70b-versatile",
-            "long-context": "llama-3.3-70b-versatile",
+            "cheap": "openai/gpt-oss-20b",
+            "general": "openai/gpt-oss-120b",
+            "reasoning": "openai/gpt-oss-120b",
+            "code": "openai/gpt-oss-120b",
+            "vision": "openai/gpt-oss-120b",
+            "long-context": "openai/gpt-oss-120b",
         },
     },
     "openai": {
@@ -119,6 +119,15 @@ if PROVIDER == "openai_compatible" and not BASE_URL:
 
 DEFAULT_MODEL = MODEL_MAP.get("general") or next(iter(MODEL_MAP.values()), None)
 
+_MODEL_ALIASES = {
+    "llama-3.1-8b-instant": "openai/gpt-oss-20b",
+    "llama-3.3-70b-versatile": "openai/gpt-oss-120b",
+}
+
+
+def _normalize_model(model: str | None) -> str | None:
+    return _MODEL_ALIASES.get(model, model) if model else model
+
 # Render (and most PaaS hosts) inject PORT and expect 0.0.0.0. Local default matches
 # mock_gateway.py's port (9000) so this is a drop-in replacement.
 _ON_RENDER = bool(_env("RENDER") or _env("PORT"))
@@ -166,6 +175,8 @@ def _call_openai_compatible(model: str, messages: list[dict], temperature: float
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
     payload = {"model": model, "messages": messages, "temperature": temperature,
                "max_tokens": max_tokens}
+    if PROVIDER == "groq":
+        payload["max_completion_tokens"] = payload.pop("max_tokens")
     data = _post_json(f"{BASE_URL}/chat/completions", headers, payload, timeout_s)
     # Already in OpenAI's shape — pass through, but make sure the fields the main
     # app reads (choices[0].message.content, usage.total_tokens) are present.
@@ -216,7 +227,7 @@ def complete(capability: str, model_hint: str | None, messages: list[dict],
     active_key = (api_key or API_KEY).strip()
     if not active_key:
         raise UpstreamError(401, "no provider API key configured")
-    model = model_hint or MODEL_MAP.get(capability) or DEFAULT_MODEL
+    model = _normalize_model(model_hint or MODEL_MAP.get(capability) or DEFAULT_MODEL)
     if not model:
         raise UpstreamError(400, f"no model configured for capability={capability!r}")
     if _cfg["kind"] == "anthropic":

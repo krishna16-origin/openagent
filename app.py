@@ -2108,7 +2108,7 @@ async def fast_reply(message: str, history: list[dict] | None = None,
         model_used = resp.get("model") or model_used
     except Exception as e:
         text = (f"I could not reach a model gateway, so I cannot answer conversationally "
-                f"right now. ({redact(str(e))[:120]})")
+                f"right now. ({redact(str(e))[:300]})")
         tokens, cached = 0, False
     return {"reply": text, "tokens": tokens, "cached": cached, "model": model_used,
             "latency_ms": int((time.monotonic() - t0) * 1000)}
@@ -2422,6 +2422,7 @@ class OmniRouteClient:
                 model = model_hint or await resolve_model_for_provider(provider, provider_key, capability)
                 if not model:
                     raise OmniRouteError(f"no usable model found for provider '{provider}'")
+                model = normalize_provider_model(provider, model)
                 data = await direct_provider_complete(provider, provider_key, messages, model,
                                                        temperature=temperature, max_tokens=max_tokens,
                                                        timeout_s=timeout_s or self.timeout)
@@ -2430,6 +2431,8 @@ class OmniRouteClient:
                 data["model"] = model
                 RESPONSE_CACHE.put(messages, capability, max_tokens, cache_key_extra, data)
                 return data
+            except OmniRouteError:
+                raise
             except Exception as e:
                 raise OmniRouteError(f"direct provider call failed: {redact(str(e))[:200]}")
 
@@ -2561,6 +2564,19 @@ DEFAULT_PROVIDERS = [
     ("groq", "Groq", "https://api.groq.com"),
     ("openrouter", "OpenRouter", "https://openrouter.ai/api"),
 ]
+
+# Groq retired these IDs on 2026-08-16. Keep old saved model selections usable
+# after a deployment/database refresh instead of sending a known-invalid ID.
+PROVIDER_MODEL_ALIASES: dict[str, dict[str, str]] = {
+    "groq": {
+        "llama-3.1-8b-instant": "openai/gpt-oss-20b",
+        "llama-3.3-70b-versatile": "openai/gpt-oss-120b",
+    },
+}
+
+
+def normalize_provider_model(provider: str, model: str) -> str:
+    return PROVIDER_MODEL_ALIASES.get((provider or "").lower(), {}).get(model, model)
 
 
 # =====================================================================================
@@ -2746,6 +2762,26 @@ async def discover_models_for_key(provider: str, api_key: str, base_url: str = "
 _OPENAI_SHAPED = ("openai", "groq", "mistral", "deepseek", "nvidia", "openrouter", "together")
 
 
+def _raise_provider_error(r: "httpx.Response") -> None:
+    """Raise an error containing the provider's actual response detail.
+
+    httpx's default HTTPStatusError only includes the status line and URL, which
+    hides the useful reason from Groq (for example, a retired model ID).
+    """
+    if r.status_code < 400:
+        return
+    try:
+        body = r.json()
+        error = body.get("error") if isinstance(body, dict) else None
+        detail = error.get("message") if isinstance(error, dict) else None
+        detail = detail or (str(body)[:400] if body else "")
+    except Exception:
+        detail = (r.text or "")[:400]
+    raise OmniRouteError(
+        f"provider returned HTTP {r.status_code}: {redact(detail) or '(no detail)'}"
+    )
+
+
 async def direct_provider_complete(provider: str, api_key: str, messages: list[dict], model: str,
                                    temperature: float = 0.2, max_tokens: int = 2000,
                                    timeout_s: float = 30.0) -> dict:
@@ -2759,6 +2795,7 @@ async def direct_provider_complete(provider: str, api_key: str, messages: list[d
     dict so every caller downstream can stay unchanged.
     """
     provider = (provider or "").lower()
+    model = normalize_provider_model(provider, model)
     base = dict((p[0], p[2]) for p in DEFAULT_PROVIDERS).get(provider, "")
     if not base:
         raise OmniRouteError(f"no direct endpoint known for provider '{provider}'")
@@ -2776,7 +2813,7 @@ async def direct_provider_complete(provider: str, api_key: str, messages: list[d
         if system:
             payload["system"] = system
         r = await http().post(url, headers=headers, json=payload, timeout=timeout_s)
-        r.raise_for_status()
+        _raise_provider_error(r)
         data = r.json()
         text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
         usage = data.get("usage") or {}
@@ -2796,7 +2833,7 @@ async def direct_provider_complete(provider: str, api_key: str, messages: list[d
         if system:
             payload["systemInstruction"] = {"parts": [{"text": system}]}
         r = await http().post(url, params={"key": api_key}, json=payload, timeout=timeout_s)
-        r.raise_for_status()
+        _raise_provider_error(r)
         data = r.json()
         candidates = data.get("candidates") or [{}]
         parts = (candidates[0].get("content") or {}).get("parts") or []
@@ -2813,9 +2850,13 @@ async def direct_provider_complete(provider: str, api_key: str, messages: list[d
         url = base + path
         assert_url_allowed(url)
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+        payload = {"model": model, "messages": messages, "temperature": temperature}
+        # Groq now documents max_completion_tokens as the supported field and
+        # uses it for the GPT-OSS replacements; keep other OpenAI-compatible
+        # providers on their existing field for compatibility.
+        payload["max_completion_tokens" if provider == "groq" else "max_tokens"] = max_tokens
         r = await http().post(url, headers=headers, json=payload, timeout=timeout_s)
-        r.raise_for_status()
+        _raise_provider_error(r)
         return r.json()
 
     raise OmniRouteError(f"no direct chat-completions support for provider '{provider}'")
@@ -2843,7 +2884,7 @@ async def resolve_model_for_provider(provider: str, api_key: str, capability: st
         if disc.get("ok"):
             models = disc.get("models") or []
     picked = pick_model(models, capability)
-    return picked["model_id"] if picked else None
+    return normalize_provider_model(provider, picked["model_id"]) if picked else None
 
 
 async def persist_models(db: AsyncSession, provider_slug: str, models: list[dict]) -> int:
