@@ -528,7 +528,7 @@
 
       function clearAuthError(message = "") { $("authError").textContent = message; }
 
-      async function api(method, path, body) {
+      async function api(method, path, body, _retry = true) {
         const options = { method, headers: { Accept: "application/json" } };
         if (state.token) options.headers.Authorization = `Bearer ${state.token}`;
         if (body !== undefined) {
@@ -541,6 +541,26 @@
         try { data = raw ? JSON.parse(raw) : {}; } catch { data = { detail: raw }; }
         if (!response.ok) {
           const detail = data.detail || data.message || `Request failed (${response.status})`;
+          // A 401 here means the stored token is dead — either it expired (access tokens
+          // last JWT_ACCESS_MINUTES, and nothing else in this app refreshes them), or the
+          // backend's database no longer has this user (e.g. an ephemeral host like Render's
+          // free tier wiped ./data on restart). Previously only boot() recovered from this;
+          // any mid-session call (sending a chat message, etc.) just dead-ended on this error.
+          // Self-heal once here instead: drop the stale token, re-auth as a fresh guest, and
+          // replay the original request before giving up.
+          const isAuthRoute = path.startsWith("/auth/");
+          if (response.status === 401 && _retry && !isAuthRoute) {
+            state.token = "";
+            localStorage.removeItem("maximus_access_token");
+            try {
+              await authenticateGuest();
+              await ensureProject();
+              const retryBody = (body && typeof body === "object" && "project_id" in body && state.project)
+                ? { ...body, project_id: state.project.id }
+                : body;
+              return api(method, path, retryBody, false);
+            } catch { /* re-auth itself failed — fall through to the real error */ }
+          }
           throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
         }
         return data;
