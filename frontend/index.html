@@ -579,6 +579,27 @@
         state.project = projects[0] || await api("POST", "/projects", { name: "My workspace", goals: "A focused space for conversations and autonomous work.", settings: {} });
       }
 
+      // Free-tier hosts (e.g. Render) spin the backend down after idle time, so the first
+      // request after a while can take 30-60s instead of failing outright. A plain fetch
+      // has no built-in timeout for that, and a cold backend can drop connections while it
+      // starts, which reads as "nothing happens" / "it's not working". Wait it out here,
+      // once, before boot() tries to authenticate — so auth doesn't fail against a backend
+      // that was still waking up.
+      async function wakeBackend(maxWaitMs = 45000) {
+        const start = Date.now();
+        let attempt = 0;
+        while (Date.now() - start < maxWaitMs) {
+          attempt++;
+          try {
+            const response = await fetch(`${API_BASE}/health`, { method: "GET" });
+            if (response.ok) { if (attempt > 1) showToast("Backend is ready."); return true; }
+          } catch { /* still waking up, or offline — keep retrying until maxWaitMs */ }
+          if (attempt === 1) showToast("Waking up the backend… this can take up to a minute on first load.");
+          await new Promise(resolve => setTimeout(resolve, 3000));
+        }
+        return false;
+      }
+
       async function boot() {
         if (demoMode) {
           state.user = { email: "demo@local" };
@@ -588,6 +609,7 @@
           renderIdle();
           return;
         }
+        await wakeBackend();
         try {
           if (state.token) {
             try { state.user = await api("GET", "/auth/me"); }
