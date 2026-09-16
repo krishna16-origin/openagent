@@ -355,6 +355,12 @@
   <div class="modal-backdrop hidden" id="settingsBackdrop" aria-hidden="true">
     <section class="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
       <div class="settings-head"><div><p class="eyebrow">Workspace settings</p><h2 id="settingsTitle">Connect your models</h2></div><button class="icon-button" id="closeSettingsButton" type="button" aria-label="Close settings">×</button></div>
+      <div class="settings-subhead"><span>Backend URL</span></div>
+      <p class="settings-copy">Where this UI sends requests. Leave blank to use the same origin the page was loaded from (the local setup). To test against a backend deployed on Render, paste its URL here.</p>
+      <form id="backendForm" class="byok-form">
+        <label class="field"><span>Backend URL</span><input id="backendUrlInput" type="url" autocomplete="off" placeholder="https://your-app.onrender.com" value=""></label>
+        <button class="auth-submit" id="saveBackendButton" type="submit">Save &amp; reload</button>
+      </form>
       <p class="settings-copy">Bring your own provider key. Maximus sends requests through your backend and never renders the secret again after saving.</p>
       <form id="byokForm" class="byok-form">
         <label class="field"><span>Provider</span><select id="providerSelect" required><option value="">Loading providers…</option></select></label>
@@ -372,7 +378,23 @@
       "use strict";
 
       const demoMode = new URLSearchParams(window.location.search).has("demo");
-      const API_BASE = window.MAXIMUS_API_BASE || "";
+
+      // Backend URL used for every API call. Resolution order:
+      //   1) ?api=<url> in the page's URL — also saved to localStorage for next time
+      //   2) a URL saved earlier via the Settings panel (localStorage)
+      //   3) window.MAXIMUS_API_BASE, if set in a <script> before this one runs
+      //   4) "" — same-origin. This is the local setup: run `python app.py`, open
+      //      http://127.0.0.1:8000/app, and the UI talks to the backend on the same port.
+      // Cloud setup: deploy app.py to Render, then either set window.MAXIMUS_API_BASE to
+      // that URL, open this page with ?api=https://your-app.onrender.com once, or paste it
+      // into Settings → Backend URL. Nothing above changes local behavior.
+      const BACKEND_URL_KEY = "maximus_backend_url";
+      const stripTrailingSlash = (value) => (value || "").trim().replace(/\/+$/, "");
+      const urlApiParam = new URLSearchParams(window.location.search).get("api");
+      if (urlApiParam) localStorage.setItem(BACKEND_URL_KEY, stripTrailingSlash(urlApiParam));
+      const API_BASE = stripTrailingSlash(
+        localStorage.getItem(BACKEND_URL_KEY) || window.MAXIMUS_API_BASE || ""
+      );
       const state = {
         token: localStorage.getItem("maximus_access_token") || "",
         user: null,
@@ -609,6 +631,7 @@
       }
 
       function openSettings() {
+        $("backendUrlInput").value = localStorage.getItem(BACKEND_URL_KEY) || "";
         $("settingsBackdrop").classList.remove("hidden");
         $("settingsBackdrop").setAttribute("aria-hidden", "false");
         loadProviderSettings();
@@ -932,6 +955,14 @@
       });
       $("composerForm").addEventListener("submit", event => { event.preventDefault(); sendMessage(); });
       $("byokForm").addEventListener("submit", connectProvider);
+      $("backendForm").addEventListener("submit", event => {
+        event.preventDefault();
+        const value = stripTrailingSlash($("backendUrlInput").value);
+        if (value) localStorage.setItem(BACKEND_URL_KEY, value);
+        else localStorage.removeItem(BACKEND_URL_KEY);
+        showToast(value ? `Backend set to ${value}` : "Backend reset to same-origin");
+        setTimeout(() => window.location.reload(), 400);
+      });
       $("newChatButton").addEventListener("click", startNewChat);
       $("settingsButton").addEventListener("click", openSettings);
       $("closeSettingsButton").addEventListener("click", closeSettings);
