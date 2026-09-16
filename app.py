@@ -2350,6 +2350,26 @@ class OmniRouteClient:
         if cached is not None:
             return cached
 
+        # BYOK short-circuit: a user-supplied key calls the provider directly instead of
+        # going through OMNIROUTE_BASE_URL, which is a separate gateway process nothing
+        # here starts automatically. No key -> unchanged gateway path below.
+        if provider_key and provider:
+            t0 = time.monotonic()
+            try:
+                model = model_hint or await resolve_model_for_provider(provider, provider_key, capability)
+                if not model:
+                    raise OmniRouteError(f"no usable model found for provider '{provider}'")
+                data = await direct_provider_complete(provider, provider_key, messages, model,
+                                                       temperature=temperature, max_tokens=max_tokens,
+                                                       timeout_s=timeout_s or self.timeout)
+                data["_latency_ms"] = int((time.monotonic() - t0) * 1000)
+                data["_cost_usd"] = data.get("_cost_usd", 0.0)
+                data["model"] = model
+                RESPONSE_CACHE.put(messages, capability, max_tokens, cache_key_extra, data)
+                return data
+            except Exception as e:
+                raise OmniRouteError(f"direct provider call failed: {redact(str(e))[:200]}")
+
         gate = gate_for(provider or _env("DEFAULT_PROVIDER", "_default"))
         est = estimate_tokens(messages, max_tokens)
         last: Exception | None = None
@@ -2655,6 +2675,112 @@ async def discover_models_for_key(provider: str, api_key: str, base_url: str = "
     except Exception as e:
         return {"ok": False, "models": [], "error": f"unparseable model list: {redact(str(e))[:120]}"}
     return {"ok": True, "models": models, "error": ""}
+
+
+# provider -> chat-completions path, derived from the discovery path (same host, the
+# "list models" tail swapped for "create a completion"). Every provider below speaks
+# the OpenAI chat-completions request/response shape natively.
+_OPENAI_SHAPED = ("openai", "groq", "mistral", "deepseek", "nvidia", "openrouter", "together")
+
+
+async def direct_provider_complete(provider: str, api_key: str, messages: list[dict], model: str,
+                                   temperature: float = 0.2, max_tokens: int = 2000,
+                                   timeout_s: float = 30.0) -> dict:
+    """Call a provider's own chat endpoint directly with the user's BYOK key.
+
+    This is what actually fulfils the BYOK promise ("Maximus calls that provider's
+    own model endpoint") for real conversational replies -- discovery already did
+    this to validate the key; completion needs to do the same thing, not go through
+    OMNIROUTE, which is a separate gateway process that most local runs never start.
+    Always returns an OpenAI-shaped {"choices":[{"message":{"content": ...}}], "usage": {...}}
+    dict so every caller downstream can stay unchanged.
+    """
+    provider = (provider or "").lower()
+    base = dict((p[0], p[2]) for p in DEFAULT_PROVIDERS).get(provider, "")
+    if not base:
+        raise OmniRouteError(f"no direct endpoint known for provider '{provider}'")
+
+    if provider == "anthropic":
+        system = "\n\n".join(m.get("content", "") for m in messages if m.get("role") == "system")
+        convo = [{"role": m["role"], "content": m.get("content", "")}
+                 for m in messages if m.get("role") in ("user", "assistant")] or [{"role": "user", "content": ""}]
+        url = base + "/v1/messages"
+        assert_url_allowed(url)
+        headers = {"x-api-key": api_key, "anthropic-version": _env("ANTHROPIC_VERSION", "2023-06-01"),
+                   "Content-Type": "application/json"}
+        payload: dict[str, Any] = {"model": model, "max_tokens": max_tokens,
+                                    "temperature": temperature, "messages": convo}
+        if system:
+            payload["system"] = system
+        r = await http().post(url, headers=headers, json=payload, timeout=timeout_s)
+        r.raise_for_status()
+        data = r.json()
+        text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+        usage = data.get("usage") or {}
+        return {"choices": [{"message": {"role": "assistant", "content": text}}],
+                "usage": {"total_tokens": int(usage.get("input_tokens", 0)) + int(usage.get("output_tokens", 0))}}
+
+    if provider == "gemini":
+        system = "\n\n".join(m.get("content", "") for m in messages if m.get("role") == "system")
+        contents = [{"role": "model" if m.get("role") == "assistant" else "user",
+                     "parts": [{"text": m.get("content", "")}]}
+                    for m in messages if m.get("role") in ("user", "assistant")] \
+            or [{"role": "user", "parts": [{"text": ""}]}]
+        url = f"{base}/v1beta/models/{model}:generateContent"
+        assert_url_allowed(url)
+        payload = {"contents": contents,
+                   "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens}}
+        if system:
+            payload["systemInstruction"] = {"parts": [{"text": system}]}
+        r = await http().post(url, params={"key": api_key}, json=payload, timeout=timeout_s)
+        r.raise_for_status()
+        data = r.json()
+        candidates = data.get("candidates") or [{}]
+        parts = (candidates[0].get("content") or {}).get("parts") or []
+        text = "".join(p.get("text", "") for p in parts)
+        usage_meta = data.get("usageMetadata") or {}
+        return {"choices": [{"message": {"role": "assistant", "content": text}}],
+                "usage": {"total_tokens": int(usage_meta.get("totalTokenCount", 0))}}
+
+    if provider in _OPENAI_SHAPED:
+        spec = PROVIDER_DISCOVERY.get(provider, PROVIDER_DISCOVERY["_default"])
+        path = spec["path"]
+        if path.endswith("models"):
+            path = path[: -len("models")] + "chat/completions"
+        url = base + path
+        assert_url_allowed(url)
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+        r = await http().post(url, headers=headers, json=payload, timeout=timeout_s)
+        r.raise_for_status()
+        return r.json()
+
+    raise OmniRouteError(f"no direct chat-completions support for provider '{provider}'")
+
+
+async def resolve_model_for_provider(provider: str, api_key: str, capability: str) -> str | None:
+    """Pick a real model id for a direct call: prefer the already-discovered catalogue,
+    fall back to a live discovery call so a freshly-added key works immediately."""
+    models: list[dict] = []
+    try:
+        SF = session_factory()
+        async with SF() as db:
+            prov = (await db.execute(select(Provider).where(Provider.slug == provider))).scalars().first()
+            if prov:
+                rows = (await db.execute(
+                    select(Model).where(Model.provider_id == prov.id, Model.enabled == True)  # noqa: E712
+                )).scalars().all()
+                models = [{"model_id": r.model_id, "capability_tags": r.capability_tags or [],
+                           "cost_in_per_1k": r.cost_in_per_1k, "context_window": r.context_window,
+                           "tier": r.tier} for r in rows]
+    except Exception:
+        models = []
+    if not models:
+        disc = await discover_models_for_key(provider, api_key)
+        if disc.get("ok"):
+            models = disc.get("models") or []
+    picked = pick_model(models, capability)
+    return picked["model_id"] if picked else None
 
 
 async def persist_models(db: AsyncSession, provider_slug: str, models: list[dict]) -> int:
