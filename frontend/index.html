@@ -377,6 +377,9 @@
     (() => {
       "use strict";
 
+      const makeId = () => (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function")
+        ? crypto.randomUUID()
+        : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
       const queryApiBase = new URLSearchParams(window.location.search).get("api");
       const isLocal = window.location.protocol !== "file:" && ["localhost", "127.0.0.1"].includes(window.location.hostname);
       const defaultApiBase = isLocal ? "http://127.0.0.1:8000" : "https://openagent-6td5.onrender.com";
@@ -392,7 +395,7 @@
         stream: null,
         busy: false,
         glanceTimer: null,
-        sessionId: crypto.randomUUID(),
+        sessionId: makeId(),
         chatSessions: [],
         monitor: [],
       };
@@ -455,7 +458,7 @@
       function startNewChat() {
         if (state.messages.length) saveCurrentChat();
         if (state.stream) { state.stream.close(); state.stream = null; }
-        state.sessionId = crypto.randomUUID(); state.messages = []; state.run = null; state.monitor = [];
+        state.sessionId = makeId(); state.messages = []; state.run = null; state.monitor = [];
         messageList.textContent = ""; welcomeView.classList.remove("hidden"); document.body.classList.remove("has-conversation");
         renderChatHistory(); renderIdle(); renderMonitor(); messageInput.focus();
       }
@@ -557,8 +560,8 @@
         let credentials;
         try { credentials = JSON.parse(localStorage.getItem("maximus_guest_credentials") || "null"); } catch { credentials = null; }
         const makeCredentials = () => ({
-          email: `guest_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}@local.maximus`,
-          password: crypto.randomUUID().replaceAll("-", "") + crypto.randomUUID().replaceAll("-", "")
+          email: `guest_${makeId().replaceAll("-", "").slice(0, 16)}@local.maximus`,
+          password: makeId().replaceAll("-", "") + makeId().replaceAll("-", "")
         });
         credentials = credentials || makeCredentials();
         try {
