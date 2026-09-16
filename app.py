@@ -2638,6 +2638,13 @@ PROVIDER_MODEL_ALIASES: dict[str, dict[str, str]] = {
     },
 }
 
+# Used only if a provider's model-list endpoint is temporarily incomplete.
+# These are chat-capable production IDs, unlike audio/moderation entries that
+# some providers include in the same catalogue.
+PROVIDER_CHAT_FALLBACKS = {
+    "groq": "openai/gpt-oss-20b",
+}
+
 
 def is_deprecated_provider_model(provider: str, model: str | None) -> bool:
     return bool(model and model in PROVIDER_MODEL_ALIASES.get((provider or "").lower(), {}))
@@ -2653,6 +2660,16 @@ def _looks_like_model_error(message: str) -> bool:
 
 def normalize_provider_model(provider: str, model: str) -> str:
     return PROVIDER_MODEL_ALIASES.get((provider or "").lower(), {}).get(model, model)
+
+
+def provider_chat_fallback(provider: str, exclude: set[str] | None = None) -> str | None:
+    model = PROVIDER_CHAT_FALLBACKS.get((provider or "").lower())
+    return model if model and model not in (exclude or set()) else None
+
+
+def is_chat_model_record(model: dict) -> bool:
+    non_chat = {"embedding", "rerank", "audio", "image", "moderation"}
+    return not any(tag in non_chat for tag in (model.get("capability_tags") or []))
 
 
 # =====================================================================================
@@ -2705,6 +2722,8 @@ PROVIDER_DISCOVERY: dict[str, dict] = {
 CAPABILITY_HINTS: tuple[tuple[str, str], ...] = (
     ("embed", "embedding"), ("rerank", "rerank"), ("whisper", "audio"), ("tts", "audio"),
     ("dall-e", "image"), ("imagen", "image"), ("flux", "image"), ("stable-diffusion", "image"),
+    ("prompt-guard", "moderation"), ("promptguard", "moderation"),
+    ("llama-guard", "moderation"), ("guard-4", "moderation"), ("safeguard", "moderation"),
     ("coder", "code"), ("code", "code"), ("devstral", "code"), ("codestral", "code"),
     ("vision", "vision"), ("-vl", "vision"), ("pixtral", "vision"), ("llava", "vision"),
     ("reasoner", "reasoning"), ("thinking", "reasoning"), ("-r1", "reasoning"),
@@ -2724,7 +2743,7 @@ def infer_capabilities(model_id: str, context_window: int = 0) -> list[str]:
             tags.append(tag)
     if not tags:
         tags = ["general"]
-    if tags[0] in ("embedding", "rerank", "audio", "image"):
+    if tags[0] in ("embedding", "rerank", "audio", "image", "moderation"):
         return tags                       # not a chat model, no general tag
     if "general" not in tags:
         tags.append("general")
@@ -2959,6 +2978,7 @@ async def resolve_model_for_provider(provider: str, api_key: str, capability: st
         disc = await discover_models_for_key(provider, api_key)
         if disc.get("ok"):
             models = disc.get("models") or []
+    models = [m for m in models if is_chat_model_record(m)]
     picked = pick_model(models, capability)
     if picked and not is_deprecated_provider_model(provider, picked["model_id"]):
         return picked["model_id"]
@@ -2968,11 +2988,13 @@ async def resolve_model_for_provider(provider: str, api_key: str, capability: st
     # round trip while stale deployments recover automatically.
     disc = await discover_models_for_key(provider, api_key)
     if not disc.get("ok"):
-        return normalize_provider_model(provider, picked["model_id"]) if picked else None
+        return (normalize_provider_model(provider, picked["model_id"]) if picked
+                else provider_chat_fallback(provider))
     live_models = [m for m in (disc.get("models") or [])
-                   if not is_deprecated_provider_model(provider, m.get("model_id"))]
+                   if is_chat_model_record(m)
+                   and not is_deprecated_provider_model(provider, m.get("model_id"))]
     picked = pick_model(live_models, capability)
-    return picked["model_id"] if picked else None
+    return picked["model_id"] if picked else provider_chat_fallback(provider)
 
 
 async def resolve_live_model_for_provider(provider: str, api_key: str, capability: str,
@@ -2984,9 +3006,10 @@ async def resolve_live_model_for_provider(provider: str, api_key: str, capabilit
     excluded = exclude or set()
     live_models = [m for m in (disc.get("models") or [])
                    if m.get("model_id") not in excluded
+                   and is_chat_model_record(m)
                    and not is_deprecated_provider_model(provider, m.get("model_id"))]
     picked = pick_model(live_models, capability)
-    return picked["model_id"] if picked else None
+    return picked["model_id"] if picked else provider_chat_fallback(provider, excluded)
 
 
 async def persist_models(db: AsyncSession, provider_slug: str, models: list[dict]) -> int:
