@@ -191,6 +191,7 @@
     .composer textarea::placeholder { color: #a4a79d; }
     .composer-tools { display: flex; align-items: center; gap: 6px; padding-bottom: 1px; }
     .mode-select { max-width: 88px; border: 0; background: transparent; color: var(--muted); padding: 8px 2px; font-size: 11px; }
+    .model-select { max-width: 150px; border: 0; background: transparent; color: var(--muted); padding: 8px 2px; font-size: 11px; text-overflow: ellipsis; }
     .send-button { width: 38px; height: 38px; display: grid; place-items: center; border: 0; border-radius: 11px; background: var(--ink); color: white; transition: transform 160ms ease-out, background 160ms ease-out; }
     .send-button:hover { background: var(--accent-strong); }
     .send-button:active { transform: scale(.97); }
@@ -265,6 +266,7 @@
       .prompt-chip { text-align: left; }
       .composer-shell { border-radius: 15px; }
       .mode-select { max-width: 76px; }
+      .model-select { max-width: 84px; }
     }
   </style>
 </head>
@@ -342,6 +344,10 @@
           <label class="sr-only" for="messageInput">Message Maximus</label>
           <textarea id="messageInput" rows="1" placeholder="Ask Maximus to do something…" autocomplete="off"></textarea>
           <div class="composer-tools">
+            <label class="sr-only" for="modelSelect">Model</label>
+            <select class="model-select" id="modelSelect" aria-label="Model" title="Model">
+              <option value="">Auto</option>
+            </select>
             <label class="sr-only" for="modeSelect">Mode</label>
             <select class="mode-select" id="modeSelect" aria-label="Mode">
               <option value="auto">Auto</option>
@@ -679,16 +685,40 @@
         const rows = Array.isArray(models) ? models.filter(model => model.enabled !== false) : [];
         $("modelCount").textContent = String(rows.length);
         if (!rows.length) {
-          const empty = document.createElement("p"); empty.className = "settings-muted"; empty.textContent = "Models appear after a provider key is connected."; list.append(empty); return;
+          const empty = document.createElement("p"); empty.className = "settings-muted"; empty.textContent = "Models appear after a provider key is connected."; list.append(empty);
+        } else {
+          const wrap = document.createElement("div"); wrap.className = "model-list";
+          rows.slice(0, 100).forEach(model => {
+            const row = document.createElement("div"); row.className = "model-item";
+            const name = document.createElement("code"); name.textContent = `${model.provider ? model.provider + " / " : ""}${model.model || "unknown"}`;
+            const tags = document.createElement("span"); tags.textContent = Array.isArray(model.tags) ? model.tags.slice(0, 2).join(" · ") : "available";
+            row.append(name, tags); wrap.append(row);
+          });
+          list.append(wrap);
         }
-        const wrap = document.createElement("div"); wrap.className = "model-list";
-        rows.slice(0, 100).forEach(model => {
-          const row = document.createElement("div"); row.className = "model-item";
-          const name = document.createElement("code"); name.textContent = `${model.provider ? model.provider + " / " : ""}${model.model || "unknown"}`;
-          const tags = document.createElement("span"); tags.textContent = Array.isArray(model.tags) ? model.tags.slice(0, 2).join(" · ") : "available";
-          row.append(name, tags); wrap.append(row);
+        populateModelSelect(rows);
+      }
+
+      // Fills the composer's model picker (distinct from the read-only catalogue in
+      // Settings) and restores whatever the user picked last session, so a selection
+      // survives a reload instead of silently reverting to "Auto".
+      function populateModelSelect(rows) {
+        const select = $("modelSelect");
+        if (!select) return;
+        const previous = select.value;
+        select.textContent = "";
+        const auto = document.createElement("option"); auto.value = ""; auto.textContent = "Auto"; select.append(auto);
+        (Array.isArray(rows) ? rows : []).filter(model => model.model).slice(0, 200).forEach(model => {
+          const option = document.createElement("option");
+          option.value = JSON.stringify({ provider: model.provider || "", model: model.model });
+          option.textContent = `${model.provider ? model.provider + " / " : ""}${model.model}`;
+          select.append(option);
         });
-        list.append(wrap);
+        const values = Array.from(select.options).map(o => o.value);
+        const stored = localStorage.getItem("maximus_selected_model") || "";
+        if (stored && values.includes(stored)) select.value = stored;
+        else if (previous && values.includes(previous)) select.value = previous;
+        else select.value = "";
       }
 
       async function loadProviderSettings() {
