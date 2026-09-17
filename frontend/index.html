@@ -58,7 +58,6 @@
     .brand-mark { width: 28px; height: 28px; display: grid; place-items: center; border-radius: 9px; background: var(--ink); color: var(--paper); font-size: 13px; font-weight: 700; letter-spacing: -.08em; }
     .brand-name { font-size: 15px; font-weight: 650; letter-spacing: -.02em; }
     .topbar-right { display: flex; align-items: center; gap: 15px; }
-    .workspace-label { display: inline-flex; gap: 7px; align-items: center; color: var(--muted); font-size: 12px; }
     .status-dot { width: 7px; height: 7px; border-radius: 50%; background: #6e9b72; box-shadow: 0 0 0 3px rgba(110, 155, 114, .12); }
     .quiet-button { border: 0; background: transparent; color: var(--muted); padding: 8px 0; font-size: 12px; transition: color 160ms ease-out, transform 160ms ease-out; }
     .quiet-button:hover { color: var(--ink); }
@@ -80,8 +79,8 @@
     .form-error { min-height: 20px; margin: 12px 0 0; color: var(--danger); font-size: 12px; line-height: 1.5; }
 
     .workspace { flex: 1; width: min(1440px, 100%); margin: 0 auto; padding: 8px 28px 150px; display: grid; grid-template-columns: 230px minmax(0, 680px) minmax(280px, 340px); justify-content: center; gap: 36px; }
-    .left-rail { align-self: stretch; min-width: 0; min-height: calc(100dvh - 96px); display: flex; flex-direction: column; padding: 38px 0 18px; border-right: 1px solid var(--line); }
-    .rail-topline, .monitor-heading, .settings-subhead { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .left-rail { align-self: stretch; min-width: 0; min-height: 0; display: flex; flex-direction: column; padding: 38px 0 18px; border-right: 1px solid var(--line); }
+    .rail-topline, .settings-subhead { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
     .rail-label, .settings-subhead { color: var(--muted); font-size: 11px; font-weight: 650; letter-spacing: .03em; }
     .new-chat-button { display: flex; align-items: center; gap: 9px; width: calc(100% - 10px); border: 0; border-radius: 10px; background: #e9e9e7; color: var(--ink); padding: 9px 10px; text-align: left; font-size: 12px; transition: background 150ms ease, transform 150ms ease; }
     .new-chat-button:hover { background: #e1e2df; }
@@ -97,21 +96,10 @@
     .icon-button { width: 27px; height: 27px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--muted); font-size: 16px; line-height: 1; transition: transform 160ms ease-out, color 160ms ease-out, background 160ms ease-out; }
     .icon-button:hover { background: var(--user-soft); color: var(--ink); }
     .icon-button:active { transform: scale(.96); }
-    .chat-history { display: grid; gap: 4px; margin: 14px 10px 22px 0; max-height: 34vh; overflow: auto; }
+    .chat-history { display: grid; gap: 4px; margin: 14px 10px 22px 0; flex: 1 1 auto; min-height: 60px; max-height: none; overflow-y: auto; align-content: start; }
     .history-empty { margin: 0; color: var(--faint); font-size: 11px; line-height: 1.5; }
     .history-item { display: block; width: 100%; overflow: hidden; border: 0; border-radius: 9px; background: transparent; color: var(--muted); padding: 9px 10px; text-align: left; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; transition: background 150ms ease, color 150ms ease; }
     .history-item:hover, .history-item.active { background: var(--user-soft); color: var(--ink); }
-    .live-monitor { min-height: 0; margin: auto 10px 18px 0; padding-top: 16px; border-top: 1px solid var(--line); }
-    .monitor-heading { color: var(--muted); font-size: 11px; font-weight: 650; }
-    .monitor-heading code { color: var(--faint); font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; text-transform: uppercase; }
-    .live-dot { display: inline-block; width: 6px; height: 6px; margin-right: 7px; border-radius: 50%; background: #6e9b72; box-shadow: 0 0 0 3px rgba(110, 155, 114, .1); vertical-align: 1px; }
-    .monitor-feed { display: grid; gap: 10px; max-height: 29vh; margin-top: 14px; overflow: auto; }
-    .monitor-empty { margin: 0; color: var(--faint); font-size: 11px; line-height: 1.5; }
-    .monitor-event { display: grid; grid-template-columns: 7px minmax(0, 1fr); gap: 8px; align-items: start; color: var(--muted); font-size: 10px; line-height: 1.4; }
-    .monitor-event:before { content: ""; width: 5px; height: 5px; margin-top: 4px; border-radius: 50%; background: var(--accent); }
-    .monitor-event strong { display: block; overflow: hidden; color: var(--ink); font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
-    .monitor-event span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .monitor-event time { color: var(--faint); font-size: 9px; }
     .settings-link { display: flex; align-items: center; gap: 9px; width: calc(100% - 10px); margin-top: auto; border: 0; border-radius: 9px; background: transparent; color: var(--muted); padding: 10px; text-align: left; font-size: 12px; transition: background 150ms ease, color 150ms ease; }
     .settings-link:hover { background: var(--user-soft); color: var(--ink); }
     .settings-glyph { color: var(--faint); font-size: 14px; }
@@ -183,15 +171,29 @@
     .action-button[disabled] { opacity: .45; cursor: wait; }
 
     .mobile-tabs { display: none; }
-    .composer-bar { position: fixed; z-index: 5; left: 0; right: 0; bottom: 0; padding: 15px 24px calc(15px + env(safe-area-inset-bottom)); background: linear-gradient(to top, var(--paper) 68%, rgba(247,247,244,0)); transition: top 220ms var(--ease-out), bottom 220ms var(--ease-out), transform 220ms var(--ease-out); }
-    body:not(.has-conversation) .composer-bar { top: 50%; bottom: auto; transform: translateY(-50%); background: transparent; }
-    .composer { width: min(760px, calc(100% - 840px)); margin: 0 auto; }
-    .composer-shell { display: flex; align-items: flex-end; gap: 9px; padding: 9px; border: 1px solid var(--line-strong); border-radius: 17px; background: rgba(255,255,253,.94); box-shadow: 0 13px 38px rgba(27,31,25,.09); }
-    .composer textarea { flex: 1; min-width: 0; min-height: 44px; max-height: 160px; resize: none; border: 0; outline: 0; background: transparent; color: var(--ink); padding: 9px 8px; font-size: 16px; line-height: 1.5; }
+    .composer-bar { position: fixed; z-index: 5; left: 0; right: 0; bottom: 0; padding: 15px 24px calc(15px + env(safe-area-inset-bottom)); background: linear-gradient(to top, var(--paper) 68%, rgba(247,247,244,0)); }
+    .composer { width: min(800px, calc(100% - 840px)); margin: 0 auto; }
+    .composer-shell { display: flex; align-items: flex-end; gap: 9px; padding: 12px; border: 1px solid var(--line-strong); border-radius: 17px; background: rgba(255,255,253,.94); box-shadow: 0 13px 38px rgba(27,31,25,.09); }
+    .composer textarea { flex: 1; min-width: 0; min-height: 62px; max-height: 180px; resize: none; border: 0; outline: 0; background: transparent; color: var(--ink); padding: 10px 8px; font-size: 16px; line-height: 1.5; }
     .composer textarea::placeholder { color: #a4a79d; }
     .composer-tools { display: flex; align-items: center; gap: 6px; padding-bottom: 1px; }
     .mode-select { max-width: 88px; border: 0; background: transparent; color: var(--muted); padding: 8px 2px; font-size: 11px; }
     .model-select { max-width: 150px; border: 0; background: transparent; color: var(--muted); padding: 8px 2px; font-size: 11px; text-overflow: ellipsis; }
+    .plugin-section { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
+    .plugin-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 0; color: var(--muted); font-size: 12px; }
+    .plugin-row strong { display: block; color: var(--ink); font-size: 12px; font-weight: 600; }
+    .plugin-row small { display: block; margin-top: 2px; color: var(--faint); font-size: 11px; line-height: 1.45; }
+    .plugin-toggle { flex: 0 0 auto; min-width: 52px; border: 1px solid var(--line-strong); border-radius: 999px; background: transparent; color: var(--muted); padding: 5px 10px; font-size: 11px; }
+    .plugin-toggle[aria-pressed="true"] { border-color: transparent; background: var(--accent-soft); color: var(--accent-strong); font-weight: 650; }
+    .catalogue-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin-top: 12px; }
+    .catalogue-card { border: 1px solid var(--line); border-radius: 12px; background: rgba(255,255,253,.55); padding: 12px; }
+    .catalogue-card h4 { margin: 0 0 4px; font-size: 12px; }
+    .catalogue-card p { margin: 0 0 8px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+    .catalogue-card .transport-badge { display: inline-block; margin-bottom: 7px; border-radius: 999px; background: var(--user-soft); color: var(--muted); padding: 3px 8px; font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .catalogue-card button { border: 1px solid var(--line-strong); border-radius: 8px; background: transparent; color: var(--ink); padding: 6px 10px; font-size: 11px; }
+    .catalogue-card button[disabled] { opacity: .45; cursor: wait; }
+    .plugin-form .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    @media (max-width: 520px) { .catalogue-grid { grid-template-columns: 1fr; } .plugin-form .field-row { grid-template-columns: 1fr; } }
     .send-button { width: 38px; height: 38px; display: grid; place-items: center; border: 0; border-radius: 11px; background: var(--ink); color: white; transition: transform 160ms ease-out, background 160ms ease-out; }
     .send-button:hover { background: var(--accent-strong); }
     .send-button:active { transform: scale(.97); }
@@ -254,10 +256,34 @@
     @media (min-width: 901px) and (max-width: 1220px) {
       .workspace { grid-template-columns: 210px minmax(0, 1fr); }
       .activity-panel { display: none; }
-      .composer { width: min(760px, calc(100% - 470px)); }
+      .composer { width: min(800px, calc(100% - 470px)); }
+    }
+    /* Desktop app layout (ChatGPT-style): fixed sidebar, chat scrolls on its own. */
+    @media (min-width: 901px) {
+      .app-shell { height: 100dvh; overflow: hidden; }
+      .workspace { min-height: 0; padding-bottom: 12px; }
+      .left-rail { overflow: hidden; }
+      .chat-area { overflow-y: auto; overscroll-behavior: contain; }
+      .chat-scroll { padding-bottom: 150px; }
+      .activity-panel { max-height: 100%; overflow-y: auto; }
+      body.activity-hidden .activity-panel { display: none; }
+    }
+    @media (min-width: 1221px) {
+      body.activity-hidden .workspace { grid-template-columns: 230px minmax(0, 1fr); }
+    }
+    @media (max-width: 900px) {
+      #activityToggleButton { display: none; }
+    }
+    /* Desktop app layout (ChatGPT-style): fixed sidebar, chat scrolls on its own. */
+    @media (min-width: 901px) {
+      .app-shell { height: 100dvh; overflow: hidden; }
+      .workspace { min-height: 0; padding-bottom: 12px; }
+      .left-rail { overflow: hidden; }
+      .chat-area { overflow-y: auto; overscroll-behavior: contain; }
+      .chat-scroll { padding-bottom: 150px; }
+      .activity-panel { max-height: 100%; overflow-y: auto; }
     }
     @media (max-width: 520px) {
-      .workspace-label { display: none; }
       .topbar { padding-top: 15px; }
       .workspace { padding-left: 16px; padding-right: 16px; }
       .welcome h1 { font-size: 44px; }
@@ -275,8 +301,7 @@
     <header class="topbar">
       <a class="brand" href="/" aria-label="Maximus home"><span class="brand-mark">M</span><span class="brand-name">Maximus</span></a>
       <div class="topbar-right">
-        <span class="workspace-label"><span class="status-dot"></span><span id="connectionLabel">Local workspace</span></span>
-        <span class="workspace-label" id="backendLabel">Backend ready</span>
+        <button class="quiet-button" id="activityToggleButton" type="button" aria-pressed="false" title="Show or hide the activity panel">Activity</button>
         <button class="quiet-button hidden" id="signOutButton" type="button">Sign out</button>
       </div>
     </header>
@@ -299,16 +324,12 @@
         <nav class="rail-nav" aria-label="Workspace links">
           <button type="button"><span>⌘</span>Pull requests</button>
           <button type="button"><span>◷</span>Scheduled</button>
-          <button type="button"><span>◌</span>Plugins</button>
+          <button type="button" id="pluginsButton"><span>◌</span>Plugins</button>
         </nav>
         <div class="rail-section-title">Projects</div>
         <p class="projects-empty">No projects</p>
         <div class="rail-topline"><span class="rail-label">Recents</span></div>
         <div class="chat-history" id="chatHistory" aria-live="polite"></div>
-        <section class="live-monitor" aria-label="Live backend monitor">
-          <div class="monitor-heading"><span><i class="live-dot"></i>Live monitor</span><code id="monitorStatus">idle</code></div>
-          <div class="monitor-feed" id="monitorFeed"><p class="monitor-empty">Waiting for a backend run.</p></div>
-        </section>
         <button class="settings-link" id="settingsButton" type="button"><span class="settings-glyph">⚙</span>Settings</button>
       </aside>
       <main class="chat-area" aria-label="Conversation">
@@ -377,6 +398,37 @@
       <div class="model-catalog"><div class="settings-subhead"><span>Available models</span><span id="modelCount" class="settings-muted">0</span></div><div id="modelList"><p class="settings-muted">Models appear after a provider key is connected.</p></div></div>
     </section>
   </div>
+  <div class="modal-backdrop hidden" id="pluginsBackdrop" aria-hidden="true">
+    <section class="settings-modal" role="dialog" aria-modal="true" aria-labelledby="pluginsTitle">
+      <div class="settings-head"><div><p class="eyebrow">Workspace plugins</p><h2 id="pluginsTitle">Plugins</h2></div><button class="icon-button" id="closePluginsButton" type="button" aria-label="Close plugins">×</button></div>
+      <p class="settings-copy">Web search runs automatically when you ask for it or a task needs it. MCP servers below extend what agents can do — add free ones or your own.</p>
+      <div class="plugin-section" style="margin-top:0;padding-top:0;border-top:0;">
+        <div class="settings-subhead"><span>Web search &amp; knowledge</span><span class="settings-muted">automatic · free</span></div>
+        <div id="webPluginsList"><p class="settings-muted">Loading…</p></div>
+      </div>
+      <div class="plugin-section">
+        <div class="settings-subhead"><span>Available MCPs</span><button class="quiet-button" id="refreshPluginsButton" type="button">Refresh</button></div>
+        <div class="catalogue-grid" id="mcpCatalogue"><p class="settings-muted">Loading…</p></div>
+      </div>
+      <div class="plugin-section">
+        <div class="settings-subhead"><span>Your MCPs</span><span class="settings-muted" id="ownMcpCount">0</span></div>
+        <div id="ownMcpList"><p class="settings-muted">None yet — add one from the catalogue or below.</p></div>
+      </div>
+      <div class="plugin-section">
+        <div class="settings-subhead"><span>Custom MCP</span><span class="settings-muted">your own server</span></div>
+        <form id="customMcpForm" class="byok-form plugin-form">
+          <label class="field"><span>Name</span><input id="customMcpName" type="text" autocomplete="off" placeholder="my-server" required></label>
+          <div class="field-row">
+            <label class="field"><span>Transport</span><select id="customMcpTransport"><option value="stdio">Command (stdio)</option><option value="http">URL (http)</option></select></label>
+            <label class="field"><span>Scopes (comma separated)</span><input id="customMcpScopes" type="text" autocomplete="off" placeholder="net:fetch"></label>
+          </div>
+          <label class="field"><span>Package / command or URL</span><input id="customMcpTarget" type="text" autocomplete="off" placeholder="@scope/mcp-server or https://… " required></label>
+          <p class="form-error" id="customMcpError" aria-live="polite"></p>
+          <button class="auth-submit" id="addMcpButton" type="submit">Add &amp; test MCP</button>
+        </form>
+      </div>
+    </section>
+  </div>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
   <script>
@@ -387,8 +439,9 @@
         ? crypto.randomUUID()
         : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
       const queryApiBase = new URLSearchParams(window.location.search).get("api");
-      const isLocal = window.location.protocol !== "file:" && ["localhost", "127.0.0.1"].includes(window.location.hostname);
-      const defaultApiBase = isLocal ? "http://127.0.0.1:8000" : "https://openagent-6td5.onrender.com";
+      // Local-only: backend always runs on this machine at 127.0.0.1:8000.
+      // Use ?api=http://127.0.0.1:8000 or window.MAXIMUS_API_BASE only to override.
+      const defaultApiBase = "http://127.0.0.1:8000";
       const API_BASE = (window.MAXIMUS_API_BASE || queryApiBase || defaultApiBase).replace(/\/+$/, "");
       const demoMode = new URLSearchParams(window.location.search).has("demo");
       const state = {
@@ -403,7 +456,6 @@
         glanceTimer: null,
         sessionId: makeId(),
         chatSessions: [],
-        monitor: [],
       };
 
       const $ = (id) => document.getElementById(id);
@@ -453,50 +505,24 @@
         const session = state.chatSessions.find(item => item.id === id);
         if (!session) return;
         if (state.stream) { state.stream.close(); state.stream = null; }
-        state.sessionId = session.id; state.messages = session.messages || []; state.run = null; state.monitor = [];
+        state.sessionId = session.id; state.messages = session.messages || []; state.run = null;
         messageList.textContent = "";
         welcomeView.classList.toggle("hidden", state.messages.length > 0);
         state.messages.forEach(message => messageList.append(makeMessage(message.role, message.content)));
         document.body.classList.toggle("has-conversation", state.messages.length > 0);
-        renderChatHistory(); renderIdle(); renderMonitor();
+        renderChatHistory(); renderIdle();
       }
 
       function startNewChat() {
         if (state.messages.length) saveCurrentChat();
         if (state.stream) { state.stream.close(); state.stream = null; }
-        state.sessionId = makeId(); state.messages = []; state.run = null; state.monitor = [];
+        state.sessionId = makeId(); state.messages = []; state.run = null;
         messageList.textContent = ""; welcomeView.classList.remove("hidden"); document.body.classList.remove("has-conversation");
-        renderChatHistory(); renderIdle(); renderMonitor(); messageInput.focus();
-      }
-
-      function renderMonitor() {
-        const feed = $("monitorFeed");
-        const status = $("monitorStatus");
-        status.textContent = state.run ? (state.run.connection === "reconnecting" ? "reconnecting" : "live") : "idle";
-        feed.textContent = "";
-        if (!state.monitor.length) {
-          const empty = document.createElement("p"); empty.className = "monitor-empty"; empty.textContent = "Waiting for a backend run."; feed.append(empty); return;
-        }
-        state.monitor.slice(-14).reverse().forEach(item => {
-          const row = document.createElement("div"); row.className = "monitor-event";
-          const content = document.createElement("div");
-          const title = document.createElement("strong"); title.textContent = item.type.replaceAll("_", " ");
-          const detail = document.createElement("span"); detail.textContent = item.detail || "event received";
-          const time = document.createElement("time"); time.textContent = new Date(item.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-          content.append(title, detail, time); row.append(content); feed.append(row);
-        });
+        renderChatHistory(); renderIdle(); messageInput.focus();
       }
 
       function escapeHtml(value) {
         return String(value ?? "").replace(/[&<>\"']/g, character => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[character]));
-      }
-
-      function recordMonitorEvent(type, payload = {}) {
-        const source = payload.node || payload;
-        const detail = payload.agent || payload.phase || payload.status || payload.goal || source?.name || source?.node_id || "event received";
-        state.monitor.push({ type, detail: String(detail), at: Date.now() });
-        if (state.monitor.length > 30) state.monitor.shift();
-        renderMonitor();
       }
 
       function showToast(message) {
@@ -514,9 +540,24 @@
         // Authentication is provisioned silently in the background; there is no sign-in wall.
         $("signOutButton").classList.add("hidden");
         if (ready) {
+          applyActivityVisibility();
           renderIdle();
           setTimeout(() => messageInput.focus(), 60);
         }
+      }
+
+      function applyActivityVisibility() {
+        const hidden = localStorage.getItem("maximus_activity_hidden") === "1";
+        document.body.classList.toggle("activity-hidden", hidden);
+        const button = $("activityToggleButton");
+        if (button) button.setAttribute("aria-pressed", String(!hidden));
+      }
+
+      function toggleActivityPanel() {
+        const hidden = !(localStorage.getItem("maximus_activity_hidden") === "1");
+        if (hidden) localStorage.setItem("maximus_activity_hidden", "1");
+        else localStorage.removeItem("maximus_activity_hidden");
+        applyActivityVisibility();
       }
 
       function setBusy(value) {
@@ -657,6 +698,7 @@
         }
         setVisible(true);
         await loadGlance();
+        try { renderModels(await api("GET", "/models")); } catch { renderModels([]); }
         state.glanceTimer = setInterval(loadGlance, 15000);
       }
 
@@ -709,10 +751,23 @@
         } else {
           const wrap = document.createElement("div"); wrap.className = "model-list";
           rows.slice(0, 100).forEach(model => {
-            const row = document.createElement("div"); row.className = "model-item";
-            const name = document.createElement("code"); name.textContent = `${model.provider ? model.provider + " / " : ""}${model.model || "unknown"}`;
-            const tags = document.createElement("span"); tags.textContent = Array.isArray(model.tags) ? model.tags.slice(0, 2).join(" · ") : "available";
-            row.append(name, tags); wrap.append(row);
+          const row = document.createElement("div"); row.className = "model-item";
+          const name = document.createElement("code"); name.textContent = shortModelName(model.model) || "unknown";
+          name.title = `${model.provider ? model.provider + " / " : ""}${model.model || "unknown"}`;
+          const tags = document.createElement("span"); tags.textContent = Array.isArray(model.tags) ? model.tags.slice(0, 2).join(" · ") : "available";
+          const use = document.createElement("button"); use.className = "delete-key"; use.type = "button"; use.textContent = "Use";
+          use.title = `Answer with ${model.provider} / ${model.model}`;
+          use.addEventListener("click", () => {
+            const value = JSON.stringify({ provider: model.provider || "", model: model.model });
+            localStorage.setItem("maximus_selected_model", value);
+            populateModelSelect(rows);
+            const select = $("modelSelect");
+            if (select) select.value = value;
+            closeSettings();
+            showToast(`Model set to ${shortModelName(model.model)}`);
+            messageInput.focus();
+          });
+            row.append(name, tags, use); wrap.append(row);
           });
           list.append(wrap);
         }
@@ -722,6 +777,13 @@
       // Fills the composer's model picker (distinct from the read-only catalogue in
       // Settings) and restores whatever the user picked last session, so a selection
       // survives a reload instead of silently reverting to "Auto".
+      // Labels show model names only (full provider/model id stays in the tooltip).
+      function shortModelName(id) {
+        const text = String(id || "");
+        const cut = text.lastIndexOf("/");
+        return (cut >= 0 ? text.slice(cut + 1) : text).trim();
+      }
+
       function populateModelSelect(rows) {
         const select = $("modelSelect");
         if (!select) return;
@@ -731,7 +793,8 @@
         (Array.isArray(rows) ? rows : []).filter(model => model.model).slice(0, 200).forEach(model => {
           const option = document.createElement("option");
           option.value = JSON.stringify({ provider: model.provider || "", model: model.model });
-          option.textContent = `${model.provider ? model.provider + " / " : ""}${model.model}`;
+          option.textContent = shortModelName(model.model) || "unknown";
+          option.title = `${model.provider ? model.provider + " / " : ""}${model.model}`;
           select.append(option);
         });
         const values = Array.from(select.options).map(o => o.value);
@@ -780,6 +843,164 @@
         finally { button.disabled = false; button.textContent = "Connect provider"; }
       }
 
+      function openPlugins() {
+        if (!state.project) { showToast("Open a workspace first"); return; }
+        $("pluginsBackdrop").classList.remove("hidden");
+        $("pluginsBackdrop").setAttribute("aria-hidden", "false");
+        loadPlugins();
+      }
+
+      function closePlugins() {
+        $("pluginsBackdrop").classList.add("hidden");
+        $("pluginsBackdrop").setAttribute("aria-hidden", "true");
+      }
+
+      function renderWebPlugins(tools) {
+        const list = $("webPluginsList");
+        list.textContent = "";
+        if (!Array.isArray(tools) || !tools.length) {
+          const empty = document.createElement("p"); empty.className = "settings-muted"; empty.textContent = "Backend unavailable."; list.append(empty); return;
+        }
+        tools.forEach(tool => {
+          const row = document.createElement("div"); row.className = "plugin-row";
+          const label = document.createElement("div");
+          const name = document.createElement("strong"); name.textContent = tool.name;
+          const desc = document.createElement("small"); desc.textContent = tool.description || "";
+          label.append(name, desc);
+          const toggle = document.createElement("button"); toggle.className = "plugin-toggle"; toggle.type = "button";
+          toggle.setAttribute("aria-pressed", String(!!tool.enabled));
+          toggle.textContent = tool.enabled ? "On" : "Off";
+          toggle.addEventListener("click", async () => {
+            toggle.disabled = true;
+            try {
+              const next = !(toggle.getAttribute("aria-pressed") === "true");
+              await api("PUT", `/projects/${encodeURIComponent(state.project.id)}/plugins`, { built_ins: { [tool.name]: next } });
+              toggle.setAttribute("aria-pressed", String(next));
+              toggle.textContent = next ? "On" : "Off";
+            } catch (error) { showToast(error.message); }
+            finally { toggle.disabled = false; }
+          });
+          row.append(label, toggle); list.append(row);
+        });
+      }
+
+      function renderCatalogue(entries) {
+        const grid = $("mcpCatalogue");
+        grid.textContent = "";
+        if (!Array.isArray(entries) || !entries.length) {
+          const empty = document.createElement("p"); empty.className = "settings-muted"; empty.textContent = "Catalogue unavailable."; grid.append(empty); return;
+        }
+        entries.forEach(entry => {
+          const card = document.createElement("div"); card.className = "catalogue-card";
+          const badge = document.createElement("span"); badge.className = "transport-badge";
+          badge.textContent = entry.kind === "builtin" ? "built-in" : entry.transport === "stdio" ? "local" : entry.transport;
+          const title = document.createElement("h4"); title.textContent = entry.name;
+          const desc = document.createElement("p"); desc.textContent = `${entry.description}${entry.note ? ` — ${entry.note}` : ""}`;
+          const add = document.createElement("button"); add.type = "button"; add.textContent = "Add";
+          add.addEventListener("click", async () => {
+            add.disabled = true; add.textContent = "Adding…";
+            try {
+              let apiKey = null;
+              if (entry.needs === "key") {
+                apiKey = window.prompt(`${entry.name} needs an API key (leave empty to cancel):`, "");
+                if (!apiKey) { add.disabled = false; add.textContent = "Add"; return; }
+              }
+              const result = await api("POST", "/mcp/servers/from-catalogue", { key: entry.key, project_id: state.project?.id || null, api_key: apiKey });
+              showToast(result.enabled ? `${result.name} connected (${(result.tools || []).length} tools)` : `${result.name} added but test failed: ${result.error || "unknown error"}`);
+              await loadOwnMcps();
+            } catch (error) { showToast(error.message); }
+            finally { add.disabled = false; add.textContent = "Add"; }
+          });
+          card.append(badge, title, desc, add); grid.append(card);
+        });
+      }
+
+      function renderOwnMcps(servers) {
+        const list = $("ownMcpList");
+        list.textContent = "";
+        const rows = Array.isArray(servers) ? servers : [];
+        $("ownMcpCount").textContent = String(rows.length);
+        if (!rows.length) {
+          const empty = document.createElement("p"); empty.className = "settings-muted"; empty.textContent = "None yet — add one from the catalogue or below."; list.append(empty); return;
+        }
+        rows.forEach(server => {
+          const row = document.createElement("div"); row.className = "connected-key";
+          const label = document.createElement("span"); label.textContent = `${server.name} · ${server.transport}${server.enabled ? "" : " (off)"}`;
+          label.title = server.url_or_cmd || "";
+          const toggle = document.createElement("button"); toggle.className = "plugin-toggle"; toggle.type = "button";
+          toggle.setAttribute("aria-pressed", String(!!server.enabled));
+          toggle.textContent = server.enabled ? "On" : "Off";
+          toggle.addEventListener("click", async () => {
+            toggle.disabled = true;
+            try {
+              const next = !(toggle.getAttribute("aria-pressed") === "true");
+              await api("PATCH", `/mcp/servers/${encodeURIComponent(server.id)}`, { enabled: next });
+              await loadOwnMcps();
+              showToast(next ? `${server.name} enabled` : `${server.name} disabled`);
+            } catch (error) { showToast(error.message); toggle.disabled = false; }
+          });
+          const test = document.createElement("button"); test.className = "delete-key"; test.type = "button"; test.textContent = "Test"; test.style.color = "var(--accent-strong)";
+          test.addEventListener("click", async () => {
+            test.disabled = true;
+            try {
+              const result = await api("POST", `/mcp/servers/${encodeURIComponent(server.id)}/test`);
+              showToast(result.ok ? `${server.name}: ${(result.tools || []).length} tool(s) OK` : `${server.name} test failed: ${result.error || "unknown error"}`);
+            } catch (error) { showToast(error.message); }
+            finally { test.disabled = false; }
+          });
+          const remove = document.createElement("button"); remove.className = "delete-key"; remove.type = "button"; remove.textContent = "Remove";
+          remove.addEventListener("click", async () => {
+            remove.disabled = true;
+            try { await api("DELETE", `/mcp/servers/${encodeURIComponent(server.id)}`); await loadOwnMcps(); showToast(`${server.name} removed`); }
+            catch (error) { showToast(error.message); remove.disabled = false; }
+          });
+          row.append(label, toggle, test, remove); list.append(row);
+        });
+      }
+
+      async function loadOwnMcps() {
+        try { renderOwnMcps(await api("GET", "/mcp/servers")); }
+        catch (error) { renderOwnMcps([]); showToast(error.message); }
+      }
+
+      async function loadPlugins() {
+        if (!state.project) return;
+        try {
+          const data = await api("GET", `/projects/${encodeURIComponent(state.project.id)}/plugins`);
+          renderWebPlugins(data.tools || []);
+        } catch { renderWebPlugins([]); }
+        try {
+          const data = await api("GET", "/mcp/catalogue");
+          renderCatalogue(data.catalogue || []);
+        } catch { renderCatalogue([]); }
+        await loadOwnMcps();
+      }
+
+      async function addCustomMcp(event) {
+        event.preventDefault();
+        const name = $("customMcpName").value.trim();
+        const transport = $("customMcpTransport").value;
+        const target = $("customMcpTarget").value.trim();
+        const scopes = $("customMcpScopes").value.split(",").map(s => s.trim()).filter(Boolean);
+        const button = $("addMcpButton");
+        $("customMcpError").textContent = "";
+        if (!name || !target) return;
+        button.disabled = true; button.textContent = "Adding…";
+        try {
+          const created = await api("POST", "/mcp/servers", { name, transport, url_or_cmd: target, allowed_scopes: scopes, project_id: state.project?.id || null });
+          $("customMcpName").value = ""; $("customMcpTarget").value = ""; $("customMcpScopes").value = "";
+          const tested = await api("POST", `/mcp/servers/${encodeURIComponent(created.id)}/test`).catch(() => ({ ok: false, error: "test failed" }));
+          if (tested.ok) {
+            await api("PATCH", `/mcp/servers/${encodeURIComponent(created.id)}`, { enabled: true }).catch(() => null);
+            showToast(`${name} connected (${(tested.tools || []).length} tools)`);
+          } else {
+            showToast(`${name} added but test failed: ${tested.error || "unknown error"}`);
+          }
+          await loadOwnMcps();
+        } catch (error) { $("customMcpError").textContent = error.message; }
+        finally { button.disabled = false; button.textContent = "Add & test MCP"; }
+      }
+
       function makeMessage(role, content, note = "") {
         const article = document.createElement("article");
         article.className = `message ${role}`;
@@ -806,7 +1027,11 @@
         state.messages.push(message);
         messageList.append(makeMessage(role, content, note));
         saveCurrentChat();
-        requestAnimationFrame(() => window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" }));
+        requestAnimationFrame(() => {
+          const scroller = document.querySelector(".chat-area");
+          if (scroller) scroller.scrollTo({ top: scroller.scrollHeight, behavior: "smooth" });
+          window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+        });
       }
 
       function glanceValue(value, fallback) {
@@ -922,7 +1147,7 @@
         state.run.latestEvent = "task_completed";
         state.run.caption = state.run.status === "completed" ? "The run finished successfully." : `Run ${state.run.status}.`;
         if (state.stream) { state.stream.close(); state.stream = null; }
-        renderRunning(); renderMonitor();
+        renderRunning();
       }
 
       function handleRunEvent(type, event) {
@@ -934,7 +1159,6 @@
         state.run.seenEvents.add(eventKey);
         if (state.run.seenEvents.size > 250) state.run.seenEvents.delete(state.run.seenEvents.values().next().value);
         state.run.latestEvent = type;
-        recordMonitorEvent(type, payload);
         if (type === "task_created") {
           upsertNode(payload.node || payload, `step-${state.run.nodes.length + 1}`);
           if (payload.goal) state.run.goal = payload.goal;
@@ -970,14 +1194,12 @@
 
       function openStream(taskId) {
         state.run = { id: taskId, goal: "", status: "queued", caption: "Opening the live run…", connection: "connecting", nodes: [], seenEvents: new Set(), latestEvent: "run_opened" };
-        state.monitor = [];
-        renderMonitor();
         renderRunning();
         if (demoMode) { state.run.caption = "Demo preview has no backend event stream."; state.run.connection = "offline"; renderRunning(); return; }
         const streamUrl = `${API_BASE}/v1/runs/${encodeURIComponent(taskId)}/stream?token=${encodeURIComponent(state.token)}`;
         const source = new EventSource(streamUrl);
         state.stream = source;
-        source.onopen = () => { if (state.run) { state.run.connection = "connected"; renderMonitor(); renderInlineWorkflow(); } };
+        source.onopen = () => { if (state.run) { state.run.connection = "connected"; renderInlineWorkflow(); } };
         ["task_created", "planning", "agent_selected", "thinking", "verification_started", "verification_failed", "task_completed"].forEach(type => source.addEventListener(type, event => handleSSEEvent(type, event)));
         source.onmessage = event => {
           try { const data = JSON.parse(event.data || "{}"); if (data.type) handleSSEEvent(data.type, event); } catch { /* typed SSE events are handled above */ }
@@ -986,7 +1208,6 @@
           if (!state.run || state.run.status === "completed" || state.run.status === "cancelled") return;
           state.run.connection = "reconnecting";
           state.run.caption = "The live connection dipped. Checking the saved run…";
-          renderMonitor();
           renderRunning();
           recoverRun(taskId);
         };
@@ -1014,12 +1235,23 @@
             appendMessage("assistant", "Demo preview is UI-only. Start the backend to receive real model replies and live workflow events.", "backend connection required");
             return;
           }
-          const response = await api("POST", "/chat", { project_id: state.project.id, message, mode, history: state.messages.slice(0, -1) });
+          const payload = { project_id: state.project.id, message, mode, history: state.messages.slice(0, -1) };
+          let pickedLabel = "";
+          try {
+            const picked = JSON.parse($("modelSelect").value || "null");
+            if (picked && picked.model) {
+              payload.model = picked.model;
+              payload.provider = picked.provider || null;
+              pickedLabel = `${picked.provider} / ${picked.model}`;
+            }
+          } catch { /* "Auto" selected — backend routes automatically */ }
+          const response = await api("POST", "/chat", payload);
+          const via = response.model ? `via ${shortModelName(response.model)}` : (pickedLabel ? `via ${shortModelName(pickedLabel)}` : "fast reply");
           if (response.mode === "task") {
-            appendMessage("assistant", response.reply || "I’ve started a task. Follow the live run in Activity.", `${(response.planned_agents || []).length || "A team of"} specialist agents queued`);
+            appendMessage("assistant", response.reply || "I’ve started a task. Follow the live run in Activity.", `${(response.planned_agents || []).length || "A team of"} specialist agents queued · ${via}`);
             openStream(response.task_id);
           } else {
-            appendMessage("assistant", response.reply || "I’m ready for the next step.", response.latency_ms ? `${response.latency_ms} ms · fast reply` : "fast reply");
+            appendMessage("assistant", response.reply || "I’m ready for the next step.", response.latency_ms ? `${response.latency_ms} ms · ${via}` : via);
           }
         } catch (error) {
           appendMessage("assistant", `I couldn’t complete that request. ${error.message}`, "request error");
@@ -1036,6 +1268,16 @@
         finally { $("authSubmit").disabled = false; $("authSubmit").textContent = "Continue"; }
       });
       $("composerForm").addEventListener("submit", event => { event.preventDefault(); sendMessage(); });
+      $("activityToggleButton").addEventListener("click", toggleActivityPanel);
+      $("pluginsButton").addEventListener("click", openPlugins);
+      $("closePluginsButton").addEventListener("click", closePlugins);
+      $("refreshPluginsButton").addEventListener("click", loadPlugins);
+      $("customMcpForm").addEventListener("submit", addCustomMcp);
+      $("pluginsBackdrop").addEventListener("click", event => { if (event.target === event.currentTarget) closePlugins(); });
+      $("modelSelect").addEventListener("change", event => {
+        if (event.target.value) localStorage.setItem("maximus_selected_model", event.target.value);
+        else localStorage.removeItem("maximus_selected_model");
+      });
       $("byokForm").addEventListener("submit", connectProvider);
       $("newChatButton").addEventListener("click", startNewChat);
       $("settingsButton").addEventListener("click", openSettings);
